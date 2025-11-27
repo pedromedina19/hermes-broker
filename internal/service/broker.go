@@ -11,7 +11,7 @@ import (
 
 type BrokerServer struct {
 	pb.UnimplementedBrokerServiceServer
-	
+
 	// Topic Map -> List of Subscriber Channels
 	subscribers map[string][]chan *pb.Message
 	mu          sync.RWMutex // protect subscriber map
@@ -27,11 +27,11 @@ func NewBrokerServer() *BrokerServer {
 func (s *BrokerServer) Publish(ctx context.Context, req *pb.PublishRequest) (*pb.PublishResponse, error) {
 	// Read Blocking (allows multiple publishers, but no new subscribers during the loop)
 	s.mu.RLock()
-	subscribers, ok := s.subscribers[req.Topic]
+	subs := make([]chan *pb.Message, len(s.subscribers[req.Topic]))
+	copy(subs, s.subscribers[req.Topic])
 	s.mu.RUnlock()
 
-	if !ok || len(subscribers) == 0 {
-		// anyone listening, just dismiss
+	if len(subs) == 0 {
 		return &pb.PublishResponse{Success: true}, nil
 	}
 
@@ -42,15 +42,9 @@ func (s *BrokerServer) Publish(ctx context.Context, req *pb.PublishRequest) (*pb
 	}
 
 	// send to all channels
-	count := 0
-	for _, subChan := range subscribers {
-		select {
-		case subChan <- msg:
-			count++
-		default:
-			// Buffer full: Drop message to avoid crashing entire broker
-			log.Printf("WARN: Dropping msg for topic %s (subscriber slow)", req.Topic)
-		}
+	for _, subChan := range subs {
+		// system slows down the reading to keep up with database
+		subChan <- msg
 	}
 
 	return &pb.PublishResponse{Success: true}, nil
@@ -58,8 +52,9 @@ func (s *BrokerServer) Publish(ctx context.Context, req *pb.PublishRequest) (*pb
 
 // stream of messages
 func (s *BrokerServer) Subscribe(req *pb.SubscribeRequest, stream pb.BrokerService_SubscribeServer) error {
-	// Buffer = 100 to handle peak loads
-	clientChan := make(chan *pb.Message, 100)
+	// Buffer = 50000 to handle peak loads
+	// This consumes ~15 MB of RAM.
+	clientChan := make(chan *pb.Message, 50000)
 
 	s.mu.Lock()
 	s.subscribers[req.Topic] = append(s.subscribers[req.Topic], clientChan)
