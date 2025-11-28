@@ -11,15 +11,16 @@ import (
 
 type BrokerServer struct {
 	pb.UnimplementedBrokerServiceServer
-
 	// Topic Map -> List of Subscriber Channels
 	subscribers map[string][]chan *pb.Message
 	mu          sync.RWMutex // protect subscriber map
+	bufferSize  int
 }
 
-func NewBrokerServer() *BrokerServer {
+func NewBrokerServer(bufferSize int) *BrokerServer {
 	return &BrokerServer{
 		subscribers: make(map[string][]chan *pb.Message),
+		bufferSize:  bufferSize,
 	}
 }
 
@@ -54,7 +55,7 @@ func (s *BrokerServer) Publish(ctx context.Context, req *pb.PublishRequest) (*pb
 func (s *BrokerServer) Subscribe(req *pb.SubscribeRequest, stream pb.BrokerService_SubscribeServer) error {
 	// Buffer = 50000 to handle peak loads
 	// This consumes ~15 MB of RAM.
-	clientChan := make(chan *pb.Message, 50000)
+	clientChan := make(chan *pb.Message, s.bufferSize)
 
 	s.mu.Lock()
 	s.subscribers[req.Topic] = append(s.subscribers[req.Topic], clientChan)
