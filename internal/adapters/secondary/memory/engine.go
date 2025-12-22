@@ -22,13 +22,19 @@ type PendingMessage struct {
 }
 
 type Subscriber struct {
-    ID      string
-    GroupID string
-    Channel chan domain.Message
+	ID      string
+	GroupID string
+	Channel chan domain.Message
+}
+
+type GroupRoundRobin struct {
+	subIDs []string // Ordered list of subscriber IDs for this group
+	next   int      // Index of next subscriber to receive (0 to len-1)
 }
 
 type MemoryBroker struct {
 	subscribers map[string]map[string]*Subscriber
+	groupStates map[string]map[string]*GroupRoundRobin
 	pendingAcks map[string]map[string]*PendingMessage
 
 	mu         sync.RWMutex
@@ -45,6 +51,7 @@ func NewMemoryBroker(bufferSize int, logger ports.Logger) *MemoryBroker {
 
 	broker := &MemoryBroker{
 		subscribers: make(map[string]map[string]*Subscriber),
+		groupStates: make(map[string]map[string]*GroupRoundRobin),
 		pendingAcks: make(map[string]map[string]*PendingMessage),
 		bufferSize:  bufferSize,
 		logger:      logger,
@@ -67,30 +74,58 @@ func (b *MemoryBroker) Publish(ctx context.Context, msg domain.Message) error {
 	}
 
 	if msg.ID == "" {
-        msg.ID = uuid.New().String()
-    }
+		msg.ID = uuid.New().String()
+	}
 
 	// Control to ensure that only ONE subscriber per group receives the message
-    groupsSent := make(map[string]bool)
+	groupsProcessed := make(map[string]bool)
 
-	for id, sub := range subs {
-        
-        if sub.GroupID != "" {
-            if groupsSent[sub.GroupID] {
-                continue
-            }
-            groupsSent[sub.GroupID] = true
-        }
-        
-        msgToSend := msg
-        select {
-        case sub.Channel <- msgToSend:
-            b.trackPending(id, msgToSend)
-        default:
-            b.logger.Warn("Dropped (Buffer Full)", "sub", id)
-        }
-    }
-    return nil
+	for _, sub := range subs {
+
+		targetSub := sub
+
+		if sub.GroupID != "" {
+			if groupsProcessed[sub.GroupID] {
+				continue
+			}
+			groupsProcessed[sub.GroupID] = true
+			targetID := b.getNextRoundRobinSub(msg.Topic, sub.GroupID)
+			if targetID == "" {
+				targetSub = sub
+			} else {
+				if s, exists := subs[targetID]; exists {
+					targetSub = s
+				}
+			}
+		}
+
+		msgToSend := msg
+		select {
+		case targetSub.Channel <- msgToSend:
+			b.trackPending(targetSub.ID, msgToSend)
+		default:
+			b.logger.Warn("Dropped (Buffer Full)", "sub", targetSub.ID)
+		}
+	}
+	return nil
+}
+
+func (b *MemoryBroker) getNextRoundRobinSub(topic, groupID string) string {
+	if states, ok := b.groupStates[topic]; ok {
+		if state, ok := states[groupID]; ok {
+			if len(state.subIDs) == 0 {
+				return ""
+			}
+
+			id := state.subIDs[state.next]
+
+			// rotate pointer: (0 -> 1 -> 2 -> 0 ...)
+			state.next = (state.next + 1) % len(state.subIDs)
+
+			return id
+		}
+	}
+	return ""
 }
 
 func (b *MemoryBroker) trackPending(subID string, msg domain.Message) {
@@ -196,7 +231,7 @@ func (b *MemoryBroker) moveToDLQ(msg domain.Message) {
 	}
 }
 
-func (b *MemoryBroker) Subscribe(ctx context.Context, topic string, groupID string) (<-chan domain.Message, string, error) {	
+func (b *MemoryBroker) Subscribe(ctx context.Context, topic string, groupID string) (<-chan domain.Message, string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -204,14 +239,29 @@ func (b *MemoryBroker) Subscribe(ctx context.Context, topic string, groupID stri
 		b.subscribers[topic] = make(map[string]*Subscriber)
 	}
 
+	if _, ok := b.groupStates[topic]; !ok {
+		b.groupStates[topic] = make(map[string]*GroupRoundRobin)
+	}
+
 	ch := make(chan domain.Message, b.bufferSize)
 	subID := uuid.New().String()
 
 	b.subscribers[topic][subID] = &Subscriber{
-        ID:      subID,
-        GroupID: groupID,
-        Channel: ch,
-    }
+		ID:      subID,
+		GroupID: groupID,
+		Channel: ch,
+	}
+
+	if groupID != "" {
+		if _, ok := b.groupStates[topic][groupID]; !ok {
+			b.groupStates[topic][groupID] = &GroupRoundRobin{
+				subIDs: make([]string, 0),
+				next:   0,
+			}
+		}
+		b.groupStates[topic][groupID].subIDs = append(b.groupStates[topic][groupID].subIDs, subID)
+	}
+
 	b.pendingAcks[subID] = make(map[string]*PendingMessage)
 
 	b.logger.Info("New subscriber added", "topic", topic, "id", subID, "group", groupID)
@@ -224,15 +274,43 @@ func (b *MemoryBroker) Unsubscribe(topic string, subID string) {
 
 	if subs, ok := b.subscribers[topic]; ok {
 		if sub, exists := subs[subID]; exists {
+			if sub.GroupID != "" {
+				b.removeFromGroupState(topic, sub.GroupID, subID)
+			}
 			close(sub.Channel)
 			delete(subs, subID)
 		}
 		if len(subs) == 0 {
 			delete(b.subscribers, topic)
+			delete(b.groupStates, topic)
 		}
 	}
 	delete(b.pendingAcks, subID)
 	b.logger.Info("Subscriber removed", "topic", topic, "id", subID)
+}
+
+func (b *MemoryBroker) removeFromGroupState(topic, groupID, subID string) {
+	if states, ok := b.groupStates[topic]; ok {
+		if state, ok := states[groupID]; ok {
+			// Find the subscriber's index in the list
+			for i, id := range state.subIDs {
+				if id == subID {
+					state.subIDs = append(state.subIDs[:i], state.subIDs[i+1:]...)
+
+					if i < state.next {
+						state.next--
+					}
+					if state.next >= len(state.subIDs) {
+						state.next = 0
+					}
+					break
+				}
+			}
+			if len(state.subIDs) == 0 {
+				delete(states, groupID)
+			}
+		}
+	}
 }
 
 func (b *MemoryBroker) Close() {
