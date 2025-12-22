@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"hash/fnv"
 	"sync"
 	"time"
 
@@ -11,9 +12,12 @@ import (
 )
 
 const (
-	AckTimeout = 5 * time.Second // If don't confirm within 5 seconds, resend
-	MaxRetries = 3               // Try 3 times before giving up
-	DlqTopic   = "hermes.dlq"    // Topic Where dead messages go
+	AckTimeout = 5 * time.Second
+	MaxRetries = 3
+	DlqTopic   = "hermes.dlq"
+
+	// to reduce lock containment
+	ShardCount = 32
 )
 
 type PendingMessage struct {
@@ -28,20 +32,30 @@ type Subscriber struct {
 }
 
 type GroupRoundRobin struct {
-	subIDs []string // Ordered list of subscriber IDs for this group
-	next   int      // Index of next subscriber to receive (0 to len-1)
+	subIDs []string
+	next   int
+}
+
+// TopicShard protects subscriber and group tree.
+type TopicShard struct {
+	mu          sync.RWMutex
+	subscribers map[string]map[string]*Subscriber      // topic -> subID -> sub
+	groupStates map[string]map[string]*GroupRoundRobin // topic -> groupID -> state
+}
+
+// AckShard protects pending issues
+type AckShard struct {
+	mu          sync.RWMutex
+	pendingAcks map[string]map[string]*PendingMessage // subID -> msgID -> Pending
 }
 
 type MemoryBroker struct {
-	subscribers map[string]map[string]*Subscriber
-	groupStates map[string]map[string]*GroupRoundRobin
-	pendingAcks map[string]map[string]*PendingMessage
+	topicShards []*TopicShard
+	ackShards   []*AckShard
 
-	mu         sync.RWMutex
 	bufferSize int
 	logger     ports.Logger
 
-	// redelivery loop control
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -49,10 +63,22 @@ type MemoryBroker struct {
 func NewMemoryBroker(bufferSize int, logger ports.Logger) *MemoryBroker {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	tShards := make([]*TopicShard, ShardCount)
+	aShards := make([]*AckShard, ShardCount)
+
+	for i := 0; i < ShardCount; i++ {
+		tShards[i] = &TopicShard{
+			subscribers: make(map[string]map[string]*Subscriber),
+			groupStates: make(map[string]map[string]*GroupRoundRobin),
+		}
+		aShards[i] = &AckShard{
+			pendingAcks: make(map[string]map[string]*PendingMessage),
+		}
+	}
+
 	broker := &MemoryBroker{
-		subscribers: make(map[string]map[string]*Subscriber),
-		groupStates: make(map[string]map[string]*GroupRoundRobin),
-		pendingAcks: make(map[string]map[string]*PendingMessage),
+		topicShards: tShards,
+		ackShards:   aShards,
 		bufferSize:  bufferSize,
 		logger:      logger,
 		ctx:         ctx,
@@ -64,11 +90,28 @@ func NewMemoryBroker(bufferSize int, logger ports.Logger) *MemoryBroker {
 	return broker
 }
 
-func (b *MemoryBroker) Publish(ctx context.Context, msg domain.Message) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+func getShardIndex(key string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return h.Sum32() % ShardCount
+}
 
-	subs, ok := b.subscribers[msg.Topic]
+func (b *MemoryBroker) getTopicShard(topic string) *TopicShard {
+	return b.topicShards[getShardIndex(topic)]
+}
+
+func (b *MemoryBroker) getAckShard(subID string) *AckShard {
+	return b.ackShards[getShardIndex(subID)]
+}
+
+func (b *MemoryBroker) Publish(ctx context.Context, msg domain.Message) error {
+	shard := b.getTopicShard(msg.Topic)
+
+	// need full locking of the Shard to ensure RoundRobin consistency
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	subs, ok := shard.subscribers[msg.Topic]
 	if !ok || len(subs) == 0 {
 		return nil
 	}
@@ -77,22 +120,21 @@ func (b *MemoryBroker) Publish(ctx context.Context, msg domain.Message) error {
 		msg.ID = uuid.New().String()
 	}
 
-	// Control to ensure that only ONE subscriber per group receives the message
 	groupsProcessed := make(map[string]bool)
 
 	for _, sub := range subs {
-
 		targetSub := sub
 
+		// Round-Robin Logic
 		if sub.GroupID != "" {
 			if groupsProcessed[sub.GroupID] {
 				continue
 			}
 			groupsProcessed[sub.GroupID] = true
-			targetID := b.getNextRoundRobinSub(msg.Topic, sub.GroupID)
-			if targetID == "" {
-				targetSub = sub
-			} else {
+
+			// Internal logic of RR accessing the groupStates map of the same Shard
+			targetID := b.getNextRoundRobinSubUnsafe(shard, msg.Topic, sub.GroupID)
+			if targetID != "" {
 				if s, exists := subs[targetID]; exists {
 					targetSub = s
 				}
@@ -110,18 +152,14 @@ func (b *MemoryBroker) Publish(ctx context.Context, msg domain.Message) error {
 	return nil
 }
 
-func (b *MemoryBroker) getNextRoundRobinSub(topic, groupID string) string {
-	if states, ok := b.groupStates[topic]; ok {
+func (b *MemoryBroker) getNextRoundRobinSubUnsafe(shard *TopicShard, topic, groupID string) string {
+	if states, ok := shard.groupStates[topic]; ok {
 		if state, ok := states[groupID]; ok {
 			if len(state.subIDs) == 0 {
 				return ""
 			}
-
 			id := state.subIDs[state.next]
-
-			// rotate pointer: (0 -> 1 -> 2 -> 0 ...)
 			state.next = (state.next + 1) % len(state.subIDs)
-
 			return id
 		}
 	}
@@ -129,22 +167,26 @@ func (b *MemoryBroker) getNextRoundRobinSub(topic, groupID string) string {
 }
 
 func (b *MemoryBroker) trackPending(subID string, msg domain.Message) {
+	shard := b.getAckShard(subID)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	if _, ok := b.pendingAcks[subID]; !ok {
-		b.pendingAcks[subID] = make(map[string]*PendingMessage)
+	if _, ok := shard.pendingAcks[subID]; !ok {
+		shard.pendingAcks[subID] = make(map[string]*PendingMessage)
 	}
 
-	b.pendingAcks[subID][msg.ID] = &PendingMessage{
+	shard.pendingAcks[subID][msg.ID] = &PendingMessage{
 		Msg:    msg,
 		SentAt: time.Now(),
 	}
 }
 
 func (b *MemoryBroker) Acknowledge(subID, msgID string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	shard := b.getAckShard(subID)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	if msgs, ok := b.pendingAcks[subID]; ok {
+	if msgs, ok := shard.pendingAcks[subID]; ok {
 		if pending, exists := msgs[msgID]; exists {
 			latency := time.Since(pending.SentAt)
 			delete(msgs, msgID)
@@ -168,52 +210,73 @@ func (b *MemoryBroker) redeliveryLoop() {
 }
 
 func (b *MemoryBroker) checkPendingMessages() {
-	// In production, we would use lock sharding
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	now := time.Now()
+	// processes each shard independently so it doesn`t block everything
+	for _, shard := range b.ackShards {
+		b.processAckShard(shard, now)
+	}
+}
 
-	for subID, msgs := range b.pendingAcks {
+func (b *MemoryBroker) processAckShard(shard *AckShard, now time.Time) {
+	// Auxiliar structure to prevent holding the lock during retransmission
+	type retryItem struct {
+		subID string
+		msg   domain.Message
+	}
+
+	shard.mu.Lock()
+
+	var retries []retryItem
+	var dlqs []domain.Message
+
+	// Identify what needs to be done under Lock.
+	for subID, msgs := range shard.pendingAcks {
 		for msgID, pending := range msgs {
 			if now.Sub(pending.SentAt) > AckTimeout {
-
 				pending.Msg.DeliveryAttempts++
 
 				if pending.Msg.DeliveryAttempts > MaxRetries {
 					b.logger.Error("Message Dead (Max Retries)", "msgID", msgID, "sub", subID)
-					b.moveToDLQ(pending.Msg)
-					delete(msgs, msgID) // Remove from local pending
+					dlqs = append(dlqs, pending.Msg)
+					delete(msgs, msgID)
 					continue
 				}
 
-				// retry
 				b.logger.Warn("Redelivering message...", "msgID", msgID, "attempt", pending.Msg.DeliveryAttempts)
-				pending.SentAt = now
+				pending.SentAt = now // timer reset
 
-				if ch := b.findSubscriberChannel(pending.Msg.Topic, subID); ch != nil {
-					select {
-					case ch <- pending.Msg:
-						// success retry
-					default:
-						// Channel full, we'll try again on the next tick
-					}
-				} else {
-					// Subscriber disappeared, remove pending item
-					delete(msgs, msgID)
-				}
+				// Add to temporary list to process AFTER Unlock
+				retries = append(retries, retryItem{subID: subID, msg: pending.Msg})
 			}
 		}
 	}
+	shard.mu.Unlock()
+
+	for _, item := range retries {
+		b.sendDirect(item.subID, item.msg)
+	}
+
+	for _, msg := range dlqs {
+		b.moveToDLQ(msg)
+	}
 }
 
-func (b *MemoryBroker) findSubscriberChannel(topic, subID string) chan domain.Message {
-	if subs, ok := b.subscribers[topic]; ok {
+func (b *MemoryBroker) sendDirect(subID string, msg domain.Message) {
+	shard := b.getTopicShard(msg.Topic)
+
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+
+	if subs, ok := shard.subscribers[msg.Topic]; ok {
 		if sub, ok := subs[subID]; ok {
-			return sub.Channel
+			select {
+			case sub.Channel <- msg:
+				// success
+			default:
+				// full channel
+			}
 		}
 	}
-	return nil
 }
 
 func (b *MemoryBroker) moveToDLQ(msg domain.Message) {
@@ -221,7 +284,11 @@ func (b *MemoryBroker) moveToDLQ(msg domain.Message) {
 	dlqMsg.Topic = DlqTopic
 	dlqMsg.ID = "dlq-" + msg.ID
 
-	if subs, ok := b.subscribers[DlqTopic]; ok {
+	shard := b.getTopicShard(DlqTopic)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+
+	if subs, ok := shard.subscribers[DlqTopic]; ok {
 		for _, sub := range subs {
 			select {
 			case sub.Channel <- dlqMsg:
@@ -232,71 +299,82 @@ func (b *MemoryBroker) moveToDLQ(msg domain.Message) {
 }
 
 func (b *MemoryBroker) Subscribe(ctx context.Context, topic string, groupID string) (<-chan domain.Message, string, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	shard := b.getTopicShard(topic)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	if _, ok := b.subscribers[topic]; !ok {
-		b.subscribers[topic] = make(map[string]*Subscriber)
+	if _, ok := shard.subscribers[topic]; !ok {
+		shard.subscribers[topic] = make(map[string]*Subscriber)
 	}
 
-	if _, ok := b.groupStates[topic]; !ok {
-		b.groupStates[topic] = make(map[string]*GroupRoundRobin)
+	if _, ok := shard.groupStates[topic]; !ok {
+		shard.groupStates[topic] = make(map[string]*GroupRoundRobin)
 	}
 
 	ch := make(chan domain.Message, b.bufferSize)
 	subID := uuid.New().String()
 
-	b.subscribers[topic][subID] = &Subscriber{
+	shard.subscribers[topic][subID] = &Subscriber{
 		ID:      subID,
 		GroupID: groupID,
 		Channel: ch,
 	}
 
 	if groupID != "" {
-		if _, ok := b.groupStates[topic][groupID]; !ok {
-			b.groupStates[topic][groupID] = &GroupRoundRobin{
+		if _, ok := shard.groupStates[topic][groupID]; !ok {
+			shard.groupStates[topic][groupID] = &GroupRoundRobin{
 				subIDs: make([]string, 0),
 				next:   0,
 			}
 		}
-		b.groupStates[topic][groupID].subIDs = append(b.groupStates[topic][groupID].subIDs, subID)
+		shard.groupStates[topic][groupID].subIDs = append(shard.groupStates[topic][groupID].subIDs, subID)
 	}
 
-	b.pendingAcks[subID] = make(map[string]*PendingMessage)
+	// Pre-allocate the map in AckShard to avoid a null check later
+	ackShard := b.getAckShard(subID)
+	ackShard.mu.Lock()
+	if _, ok := ackShard.pendingAcks[subID]; !ok {
+		ackShard.pendingAcks[subID] = make(map[string]*PendingMessage)
+	}
+	ackShard.mu.Unlock()
 
 	b.logger.Info("New subscriber added", "topic", topic, "id", subID, "group", groupID)
 	return ch, subID, nil
 }
 
 func (b *MemoryBroker) Unsubscribe(topic string, subID string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	shard := b.getTopicShard(topic)
+	shard.mu.Lock()
 
-	if subs, ok := b.subscribers[topic]; ok {
+	if subs, ok := shard.subscribers[topic]; ok {
 		if sub, exists := subs[subID]; exists {
 			if sub.GroupID != "" {
-				b.removeFromGroupState(topic, sub.GroupID, subID)
+				b.removeFromGroupState(shard, topic, sub.GroupID, subID)
 			}
 			close(sub.Channel)
 			delete(subs, subID)
 		}
 		if len(subs) == 0 {
-			delete(b.subscribers, topic)
-			delete(b.groupStates, topic)
+			delete(shard.subscribers, topic)
+			delete(shard.groupStates, topic)
 		}
 	}
-	delete(b.pendingAcks, subID)
+	shard.mu.Unlock()
+
+	ackShard := b.getAckShard(subID)
+	ackShard.mu.Lock()
+	delete(ackShard.pendingAcks, subID)
+	ackShard.mu.Unlock()
+
 	b.logger.Info("Subscriber removed", "topic", topic, "id", subID)
 }
 
-func (b *MemoryBroker) removeFromGroupState(topic, groupID, subID string) {
-	if states, ok := b.groupStates[topic]; ok {
+func (b *MemoryBroker) removeFromGroupState(shard *TopicShard, topic, groupID, subID string) {
+	if states, ok := shard.groupStates[topic]; ok {
 		if state, ok := states[groupID]; ok {
-			// Find the subscriber's index in the list
 			for i, id := range state.subIDs {
 				if id == subID {
 					state.subIDs = append(state.subIDs[:i], state.subIDs[i+1:]...)
-
 					if i < state.next {
 						state.next--
 					}
@@ -315,15 +393,16 @@ func (b *MemoryBroker) removeFromGroupState(topic, groupID, subID string) {
 
 func (b *MemoryBroker) Close() {
 	b.cancel()
-	b.mu.Lock()
-	defer b.mu.Unlock()
 
-	for _, subs := range b.subscribers {
-		for _, sub := range subs {
-			close(sub.Channel)
+	for _, shard := range b.topicShards {
+		shard.mu.Lock()
+		for _, subs := range shard.subscribers {
+			for _, sub := range subs {
+				close(sub.Channel)
+			}
 		}
+		shard.mu.Unlock()
 	}
-	b.subscribers = nil
-	b.pendingAcks = nil
+
 	b.logger.Info("Memory Broker engine shutdown complete")
 }
