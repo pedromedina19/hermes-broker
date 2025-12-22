@@ -24,7 +24,7 @@ const (
 type PublishRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Topic         string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
-	Payload       []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"` // Dados binários brutos (JSON serializado ou qualquer coisa)
+	Payload       []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"` // Raw binary data (serialized JSON or anything else)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -119,7 +119,10 @@ func (x *PublishResponse) GetSuccess() bool {
 
 type SubscribeRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Topic         string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
+	Topic         string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`                                     // Filled in only on the first package (Handshake)
+	AckMessageId  string                 `protobuf:"bytes,2,opt,name=ack_message_id,json=ackMessageId,proto3" json:"ack_message_id,omitempty"` // Filled in when it is an ACK.
+	Action        string                 `protobuf:"bytes,3,opt,name=action,proto3" json:"action,omitempty"`                                   // "SUBSCRIBE" or "ACK"
+	GroupId       string                 `protobuf:"bytes,4,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                  // Consumer Group
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -161,11 +164,33 @@ func (x *SubscribeRequest) GetTopic() string {
 	return ""
 }
 
+func (x *SubscribeRequest) GetAckMessageId() string {
+	if x != nil {
+		return x.AckMessageId
+	}
+	return ""
+}
+
+func (x *SubscribeRequest) GetAction() string {
+	if x != nil {
+		return x.Action
+	}
+	return ""
+}
+
+func (x *SubscribeRequest) GetGroupId() string {
+	if x != nil {
+		return x.GroupId
+	}
+	return ""
+}
+
 type Message struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Topic         string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
-	Payload       []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
-	Timestamp     int64                  `protobuf:"varint,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"` // Útil para métricas de latência
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Topic         string                 `protobuf:"bytes,2,opt,name=topic,proto3" json:"topic,omitempty"`
+	Payload       []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"`
+	Timestamp     int64                  `protobuf:"varint,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -200,6 +225,13 @@ func (*Message) Descriptor() ([]byte, []int) {
 	return file_proto_broker_proto_rawDescGZIP(), []int{3}
 }
 
+func (x *Message) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
 func (x *Message) GetTopic() string {
 	if x != nil {
 		return x.Topic
@@ -230,16 +262,20 @@ const file_proto_broker_proto_rawDesc = "" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x18\n" +
 	"\apayload\x18\x02 \x01(\fR\apayload\"+\n" +
 	"\x0fPublishResponse\x12\x18\n" +
-	"\asuccess\x18\x01 \x01(\bR\asuccess\"(\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\"\x81\x01\n" +
 	"\x10SubscribeRequest\x12\x14\n" +
-	"\x05topic\x18\x01 \x01(\tR\x05topic\"W\n" +
-	"\aMessage\x12\x14\n" +
-	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x18\n" +
-	"\apayload\x18\x02 \x01(\fR\apayload\x12\x1c\n" +
-	"\ttimestamp\x18\x03 \x01(\x03R\ttimestamp2\x85\x01\n" +
+	"\x05topic\x18\x01 \x01(\tR\x05topic\x12$\n" +
+	"\x0eack_message_id\x18\x02 \x01(\tR\fackMessageId\x12\x16\n" +
+	"\x06action\x18\x03 \x01(\tR\x06action\x12\x19\n" +
+	"\bgroup_id\x18\x04 \x01(\tR\agroupId\"g\n" +
+	"\aMessage\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x14\n" +
+	"\x05topic\x18\x02 \x01(\tR\x05topic\x12\x18\n" +
+	"\apayload\x18\x03 \x01(\fR\apayload\x12\x1c\n" +
+	"\ttimestamp\x18\x04 \x01(\x03R\ttimestamp2\x87\x01\n" +
 	"\rBrokerService\x12:\n" +
-	"\aPublish\x12\x16.broker.PublishRequest\x1a\x17.broker.PublishResponse\x128\n" +
-	"\tSubscribe\x12\x18.broker.SubscribeRequest\x1a\x0f.broker.Message0\x01B+Z)github.com/pedromedina19/hermes-broker/pbb\x06proto3"
+	"\aPublish\x12\x16.broker.PublishRequest\x1a\x17.broker.PublishResponse\x12:\n" +
+	"\tSubscribe\x12\x18.broker.SubscribeRequest\x1a\x0f.broker.Message(\x010\x01B+Z)github.com/pedromedina19/hermes-broker/pbb\x06proto3"
 
 var (
 	file_proto_broker_proto_rawDescOnce sync.Once

@@ -27,10 +27,10 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type BrokerServiceClient interface {
-	// Publicar é "Fire and Forget" (Unary)
+	// Publishing is "Fire and Forget" (Unary)
 	Publish(ctx context.Context, in *PublishRequest, opts ...grpc.CallOption) (*PublishResponse, error)
-	// Inscrever é um fluxo contínuo de dados (Server-Side Streaming)
-	Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Message], error)
+	// Subscribing is a continuous flow of data (Server-Side Streaming).
+	Subscribe(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SubscribeRequest, Message], error)
 }
 
 type brokerServiceClient struct {
@@ -51,33 +51,27 @@ func (c *brokerServiceClient) Publish(ctx context.Context, in *PublishRequest, o
 	return out, nil
 }
 
-func (c *brokerServiceClient) Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Message], error) {
+func (c *brokerServiceClient) Subscribe(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SubscribeRequest, Message], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &BrokerService_ServiceDesc.Streams[0], BrokerService_Subscribe_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	x := &grpc.GenericClientStream[SubscribeRequest, Message]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
 	return x, nil
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type BrokerService_SubscribeClient = grpc.ServerStreamingClient[Message]
+type BrokerService_SubscribeClient = grpc.BidiStreamingClient[SubscribeRequest, Message]
 
 // BrokerServiceServer is the server API for BrokerService service.
 // All implementations must embed UnimplementedBrokerServiceServer
 // for forward compatibility.
 type BrokerServiceServer interface {
-	// Publicar é "Fire and Forget" (Unary)
+	// Publishing is "Fire and Forget" (Unary)
 	Publish(context.Context, *PublishRequest) (*PublishResponse, error)
-	// Inscrever é um fluxo contínuo de dados (Server-Side Streaming)
-	Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[Message]) error
+	// Subscribing is a continuous flow of data (Server-Side Streaming).
+	Subscribe(grpc.BidiStreamingServer[SubscribeRequest, Message]) error
 	mustEmbedUnimplementedBrokerServiceServer()
 }
 
@@ -91,7 +85,7 @@ type UnimplementedBrokerServiceServer struct{}
 func (UnimplementedBrokerServiceServer) Publish(context.Context, *PublishRequest) (*PublishResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Publish not implemented")
 }
-func (UnimplementedBrokerServiceServer) Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[Message]) error {
+func (UnimplementedBrokerServiceServer) Subscribe(grpc.BidiStreamingServer[SubscribeRequest, Message]) error {
 	return status.Errorf(codes.Unimplemented, "method Subscribe not implemented")
 }
 func (UnimplementedBrokerServiceServer) mustEmbedUnimplementedBrokerServiceServer() {}
@@ -134,15 +128,11 @@ func _BrokerService_Publish_Handler(srv interface{}, ctx context.Context, dec fu
 }
 
 func _BrokerService_Subscribe_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(SubscribeRequest)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(BrokerServiceServer).Subscribe(m, &grpc.GenericServerStream[SubscribeRequest, Message]{ServerStream: stream})
+	return srv.(BrokerServiceServer).Subscribe(&grpc.GenericServerStream[SubscribeRequest, Message]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type BrokerService_SubscribeServer = grpc.ServerStreamingServer[Message]
+type BrokerService_SubscribeServer = grpc.BidiStreamingServer[SubscribeRequest, Message]
 
 // BrokerService_ServiceDesc is the grpc.ServiceDesc for BrokerService service.
 // It's only intended for direct use with grpc.RegisterService,
@@ -161,6 +151,7 @@ var BrokerService_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "Subscribe",
 			Handler:       _BrokerService_Subscribe_Handler,
 			ServerStreams: true,
+			ClientStreams: true,
 		},
 	},
 	Metadata: "proto/broker.proto",

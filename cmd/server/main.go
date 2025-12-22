@@ -1,51 +1,74 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"net"
-	"net/http"
-	_ "net/http/pprof"
-	"runtime"
-	"time"
+	"os"
+	"os/signal"
+	"syscall"
 
-	"github.com/pedromedina19/hermes-broker/internal/pkg/monitoring"
-	"github.com/pedromedina19/hermes-broker/internal/service"
-	"github.com/pedromedina19/hermes-broker/pb"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
+
+	grpc_adapter "github.com/pedromedina19/hermes-broker/internal/adapters/primary/grpc"
+	"github.com/pedromedina19/hermes-broker/internal/adapters/secondary/config"
+	"github.com/pedromedina19/hermes-broker/internal/adapters/secondary/memory"
+	"github.com/pedromedina19/hermes-broker/internal/adapters/secondary/persistence"
+	"github.com/pedromedina19/hermes-broker/internal/core/services"
+	"github.com/pedromedina19/hermes-broker/pb"
 )
 
 func main() {
-	listener, err := net.Listen("tcp", ":50051")
+	cfg := config.Load()
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	
+	logger.Info("Starting Hermes Broker", "config", cfg)
+
+	brokerEngine := memory.NewMemoryBroker(cfg.BufferSize, logger)
+
+	wal, err := persistence.NewFileWAL("hermes.wal", logger)
 	if err != nil {
-		log.Fatalf("Failed to start listener TCP: %v", err)
+		logger.Error("Failed to initialize WAL", "error", err)
+		os.Exit(1)
+	}
+	
+	brokerService := services.NewBrokerService(brokerEngine, wal)
+
+	logger.Info("Recovering state from WAL...")
+	if err := brokerService.RecoverState(); err != nil {
+		logger.Error("Failed to recover state", "error", err)
+		// Depending on the criticality, we could either end up with an error or continue empty
+	}
+	
+	grpcHandler := grpc_adapter.NewGrpcHandler(brokerService, logger)
+
+	listener, err := net.Listen("tcp", cfg.GRPCPort)
+	if err != nil {
+		logger.Error("Failed to listen", "error", err)
+		os.Exit(1)
 	}
 
 	grpcServer := grpc.NewServer()
-
-	// (8 cores) -> Buffer 80.000
-	// (2 cores) -> Buffer 20.000
-	cpuCores := runtime.NumCPU()
-	bufferSize := cpuCores * 10000
-
-	log.Printf("Hermes Tuning: %d CPUs | Channel Buffer: %d msgs", cpuCores, bufferSize)
-
-	brokerService := service.NewBrokerServer(bufferSize)
-	pb.RegisterBrokerServiceServer(grpcServer, brokerService)
-
-	// Enable Reflection so we can use tools like Postman
+	pb.RegisterBrokerServiceServer(grpcServer, grpcHandler)
 	reflection.Register(grpcServer)
 
-	monitoring.StartMonitoring(5 * time.Second)
+	//Graceful Shutdown
+	stopChan := make(chan os.Signal, 1)
+	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-        http.Handle("/metrics", promhttp.Handler())
-        http.ListenAndServe(":2112", nil) 
-    }()
+		logger.Info("gRPC Server listening", "address", cfg.GRPCPort)
+		if err := grpcServer.Serve(listener); err != nil {
+			logger.Error("gRPC Server error", "error", err)
+		}
+	}()
 
-	log.Println("Hermes Broker (gRPC) started at port :50051")
-	if err := grpcServer.Serve(listener); err != nil {
-		log.Fatalf("Failed to serve gRPC: %v", err)
-	}
+	<-stopChan
+	logger.Info("Shutting down server...")
+
+	grpcServer.GracefulStop()
+	brokerEngine.Close()
+	wal.Close()
+
+	logger.Info("Server exited properly")
 }

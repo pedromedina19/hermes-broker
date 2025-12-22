@@ -1,0 +1,109 @@
+package grpc_adapter
+
+import (
+	"context"
+	"io"
+	"log/slog"
+
+	"github.com/pedromedina19/hermes-broker/internal/core/services"
+	"github.com/pedromedina19/hermes-broker/pb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+type GrpcHandler struct {
+	pb.UnimplementedBrokerServiceServer
+	service *services.BrokerService
+	logger  *slog.Logger
+}
+
+func NewGrpcHandler(service *services.BrokerService, logger *slog.Logger) *GrpcHandler {
+	return &GrpcHandler{
+		service: service,
+		logger:  logger,
+	}
+}
+
+func (h *GrpcHandler) Publish(ctx context.Context, req *pb.PublishRequest) (*pb.PublishResponse, error) {
+	err := h.service.Publish(ctx, req.Topic, req.Payload)
+	if err != nil {
+		h.logger.Error("Failed to publish", "error", err)
+		return &pb.PublishResponse{Success: false}, status.Error(codes.Internal, "Failed to publish")
+	}
+	return &pb.PublishResponse{Success: true}, nil
+}
+
+func (h *GrpcHandler) Subscribe(stream pb.BrokerService_SubscribeServer) error {
+	ctx := stream.Context()
+
+	// Handshake: The first package MUST be the SUBSCRIBE package with the Topic
+	firstReq, err := stream.Recv()
+	if err != nil {
+		return status.Error(codes.InvalidArgument, "Stream error waiting for handshake")
+	}
+	if firstReq.Action != "SUBSCRIBE" || firstReq.Topic == "" {
+		return status.Error(codes.InvalidArgument, "First message must be SUBSCRIBE with Topic")
+	}
+
+	topic := firstReq.Topic
+	groupID := firstReq.GroupId
+	h.logger.Info("Client requesting subscription", "topic", topic, "group", groupID)
+	// subascribe for Engine
+	msgChan, subID, err := h.service.Subscribe(ctx, topic, groupID)
+	if err != nil {
+		return err
+	}
+	defer h.service.RemoveSubscriber(topic, subID)
+
+	// Output Loop (Server -> Client)
+	// Goroutine to send messages while the main loop listens for ACKs.
+	errChan := make(chan error, 1)
+
+	go func() {
+		for {
+			select {
+			case msg, ok := <-msgChan:
+				if !ok {
+					return // Channel closed
+				}
+				resp := &pb.Message{
+					Id:        msg.ID, 
+					Topic:     msg.Topic,
+					Payload:   msg.Payload,
+					Timestamp: msg.Timestamp.UnixNano(),
+				}
+				if err := stream.Send(resp); err != nil {
+					h.logger.Warn("Failed to send msg", "id", subID, "err", err)
+					errChan <- err
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Input Loop (Client -> Server: ACKs)
+	// This loop blocks Subscribe function, keeping stream alive.
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF {
+			return nil // client close connection
+		}
+		if err != nil {
+			// client drop connection
+			// checked if there was a shipping error in the goroutine above
+			select {
+			case e := <-errChan:
+				return e
+			default:
+				h.logger.Error("Stream recv error", "err", err)
+				return err
+			}
+		}
+
+		if req.Action == "ACK" {
+			h.service.Acknowledge(subID, req.AckMessageId)
+		}
+	}
+}
