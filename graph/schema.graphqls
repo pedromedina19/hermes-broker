@@ -1,0 +1,22 @@
+type Message {
+  id: ID!
+  topic: String!
+  payload: String!
+  timestamp: Int!
+}
+
+type PublishResponse {
+  success: Boolean!
+}
+
+type Query {
+  health: String!
+}
+
+type Mutation {
+  publish(topic: String!, payload: String!): PublishResponse!
+}
+
+type Subscription {
+  subscribe(topic: String!, groupId: String): Message!
+}
