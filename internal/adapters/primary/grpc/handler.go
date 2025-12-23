@@ -107,3 +107,20 @@ func (h *GrpcHandler) Subscribe(stream pb.BrokerService_SubscribeServer) error {
 		}
 	}
 }
+
+func (h *GrpcHandler) Join(ctx context.Context, req *pb.JoinRequest) (*pb.JoinResponse, error) {
+    if req.NodeId == "" || req.RaftAddr == "" {
+        return &pb.JoinResponse{Success: false, Error: "missing node_id or raft_addr"}, status.Error(codes.InvalidArgument, "missing params")
+    }
+
+    h.logger.Info("Received gRPC Join request", "node_id", req.NodeId, "addr", req.RaftAddr)
+
+    err := h.service.JoinCluster(req.NodeId, req.RaftAddr)
+    if err != nil {
+        h.logger.Error("Failed to join cluster via gRPC", "error", err)
+        // return a gRPC error to inform the client.
+        return &pb.JoinResponse{Success: false, Error: err.Error()}, status.Error(codes.Internal, err.Error())
+    }
+
+    return &pb.JoinResponse{Success: true}, nil
+}

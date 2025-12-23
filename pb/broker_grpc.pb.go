@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	BrokerService_Publish_FullMethodName   = "/broker.BrokerService/Publish"
 	BrokerService_Subscribe_FullMethodName = "/broker.BrokerService/Subscribe"
+	BrokerService_Join_FullMethodName      = "/broker.BrokerService/Join"
 )
 
 // BrokerServiceClient is the client API for BrokerService service.
@@ -31,6 +32,8 @@ type BrokerServiceClient interface {
 	Publish(ctx context.Context, in *PublishRequest, opts ...grpc.CallOption) (*PublishResponse, error)
 	// Subscribing is a continuous flow of data (Server-Side Streaming).
 	Subscribe(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SubscribeRequest, Message], error)
+	// cluster management
+	Join(ctx context.Context, in *JoinRequest, opts ...grpc.CallOption) (*JoinResponse, error)
 }
 
 type brokerServiceClient struct {
@@ -64,6 +67,16 @@ func (c *brokerServiceClient) Subscribe(ctx context.Context, opts ...grpc.CallOp
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type BrokerService_SubscribeClient = grpc.BidiStreamingClient[SubscribeRequest, Message]
 
+func (c *brokerServiceClient) Join(ctx context.Context, in *JoinRequest, opts ...grpc.CallOption) (*JoinResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(JoinResponse)
+	err := c.cc.Invoke(ctx, BrokerService_Join_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // BrokerServiceServer is the server API for BrokerService service.
 // All implementations must embed UnimplementedBrokerServiceServer
 // for forward compatibility.
@@ -72,6 +85,8 @@ type BrokerServiceServer interface {
 	Publish(context.Context, *PublishRequest) (*PublishResponse, error)
 	// Subscribing is a continuous flow of data (Server-Side Streaming).
 	Subscribe(grpc.BidiStreamingServer[SubscribeRequest, Message]) error
+	// cluster management
+	Join(context.Context, *JoinRequest) (*JoinResponse, error)
 	mustEmbedUnimplementedBrokerServiceServer()
 }
 
@@ -87,6 +102,9 @@ func (UnimplementedBrokerServiceServer) Publish(context.Context, *PublishRequest
 }
 func (UnimplementedBrokerServiceServer) Subscribe(grpc.BidiStreamingServer[SubscribeRequest, Message]) error {
 	return status.Errorf(codes.Unimplemented, "method Subscribe not implemented")
+}
+func (UnimplementedBrokerServiceServer) Join(context.Context, *JoinRequest) (*JoinResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Join not implemented")
 }
 func (UnimplementedBrokerServiceServer) mustEmbedUnimplementedBrokerServiceServer() {}
 func (UnimplementedBrokerServiceServer) testEmbeddedByValue()                       {}
@@ -134,6 +152,24 @@ func _BrokerService_Subscribe_Handler(srv interface{}, stream grpc.ServerStream)
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type BrokerService_SubscribeServer = grpc.BidiStreamingServer[SubscribeRequest, Message]
 
+func _BrokerService_Join_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(JoinRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BrokerServiceServer).Join(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BrokerService_Join_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BrokerServiceServer).Join(ctx, req.(*JoinRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // BrokerService_ServiceDesc is the grpc.ServiceDesc for BrokerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -144,6 +180,10 @@ var BrokerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Publish",
 			Handler:    _BrokerService_Publish_Handler,
+		},
+		{
+			MethodName: "Join",
+			Handler:    _BrokerService_Join_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

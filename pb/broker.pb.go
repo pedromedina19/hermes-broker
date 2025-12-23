@@ -253,6 +253,110 @@ func (x *Message) GetTimestamp() int64 {
 	return 0
 }
 
+type JoinRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`       // Ex: "node-2"
+	RaftAddr      string                 `protobuf:"bytes,2,opt,name=raft_addr,json=raftAddr,proto3" json:"raft_addr,omitempty"` // Ex: "localhost:6001" (raft internal address)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *JoinRequest) Reset() {
+	*x = JoinRequest{}
+	mi := &file_proto_broker_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *JoinRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*JoinRequest) ProtoMessage() {}
+
+func (x *JoinRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_broker_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use JoinRequest.ProtoReflect.Descriptor instead.
+func (*JoinRequest) Descriptor() ([]byte, []int) {
+	return file_proto_broker_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *JoinRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *JoinRequest) GetRaftAddr() string {
+	if x != nil {
+		return x.RaftAddr
+	}
+	return ""
+}
+
+type JoinResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *JoinResponse) Reset() {
+	*x = JoinResponse{}
+	mi := &file_proto_broker_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *JoinResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*JoinResponse) ProtoMessage() {}
+
+func (x *JoinResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_broker_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use JoinResponse.ProtoReflect.Descriptor instead.
+func (*JoinResponse) Descriptor() ([]byte, []int) {
+	return file_proto_broker_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *JoinResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *JoinResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 var File_proto_broker_proto protoreflect.FileDescriptor
 
 const file_proto_broker_proto_rawDesc = "" +
@@ -272,10 +376,17 @@ const file_proto_broker_proto_rawDesc = "" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x14\n" +
 	"\x05topic\x18\x02 \x01(\tR\x05topic\x12\x18\n" +
 	"\apayload\x18\x03 \x01(\fR\apayload\x12\x1c\n" +
-	"\ttimestamp\x18\x04 \x01(\x03R\ttimestamp2\x87\x01\n" +
+	"\ttimestamp\x18\x04 \x01(\x03R\ttimestamp\"C\n" +
+	"\vJoinRequest\x12\x17\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1b\n" +
+	"\traft_addr\x18\x02 \x01(\tR\braftAddr\">\n" +
+	"\fJoinResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error2\xba\x01\n" +
 	"\rBrokerService\x12:\n" +
 	"\aPublish\x12\x16.broker.PublishRequest\x1a\x17.broker.PublishResponse\x12:\n" +
-	"\tSubscribe\x12\x18.broker.SubscribeRequest\x1a\x0f.broker.Message(\x010\x01B+Z)github.com/pedromedina19/hermes-broker/pbb\x06proto3"
+	"\tSubscribe\x12\x18.broker.SubscribeRequest\x1a\x0f.broker.Message(\x010\x01\x121\n" +
+	"\x04Join\x12\x13.broker.JoinRequest\x1a\x14.broker.JoinResponseB+Z)github.com/pedromedina19/hermes-broker/pbb\x06proto3"
 
 var (
 	file_proto_broker_proto_rawDescOnce sync.Once
@@ -289,20 +400,24 @@ func file_proto_broker_proto_rawDescGZIP() []byte {
 	return file_proto_broker_proto_rawDescData
 }
 
-var file_proto_broker_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_proto_broker_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_proto_broker_proto_goTypes = []any{
 	(*PublishRequest)(nil),   // 0: broker.PublishRequest
 	(*PublishResponse)(nil),  // 1: broker.PublishResponse
 	(*SubscribeRequest)(nil), // 2: broker.SubscribeRequest
 	(*Message)(nil),          // 3: broker.Message
+	(*JoinRequest)(nil),      // 4: broker.JoinRequest
+	(*JoinResponse)(nil),     // 5: broker.JoinResponse
 }
 var file_proto_broker_proto_depIdxs = []int32{
 	0, // 0: broker.BrokerService.Publish:input_type -> broker.PublishRequest
 	2, // 1: broker.BrokerService.Subscribe:input_type -> broker.SubscribeRequest
-	1, // 2: broker.BrokerService.Publish:output_type -> broker.PublishResponse
-	3, // 3: broker.BrokerService.Subscribe:output_type -> broker.Message
-	2, // [2:4] is the sub-list for method output_type
-	0, // [0:2] is the sub-list for method input_type
+	4, // 2: broker.BrokerService.Join:input_type -> broker.JoinRequest
+	1, // 3: broker.BrokerService.Publish:output_type -> broker.PublishResponse
+	3, // 4: broker.BrokerService.Subscribe:output_type -> broker.Message
+	5, // 5: broker.BrokerService.Join:output_type -> broker.JoinResponse
+	3, // [3:6] is the sub-list for method output_type
+	0, // [0:3] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -319,7 +434,7 @@ func file_proto_broker_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_broker_proto_rawDesc), len(file_proto_broker_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   4,
+			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

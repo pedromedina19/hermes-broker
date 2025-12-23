@@ -15,13 +15,23 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "sub", "Modo: 'pub' ou 'sub'")
+	mode := flag.String("mode", "sub", "Modo: 'pub', 'sub' ou 'join'")
 	topic := flag.String("topic", "default-topic", "Tópico")
 	groupID := flag.String("group", "", "Consumer Group ID (optional)")
 	msgContent := flag.String("msg", "Hello Hermes", "content (pub)")
 	count := flag.Int("count", 1, "Qtd (pub)")
 	shouldAck := flag.Bool("ack", true, "If true, sends an ACK. If false, simulates a failure")
+	joinNodeID := flag.String("join-node", "", "Node ID to add (join mode)")
+    joinAddr := flag.String("join-addr", "", "Raft Address of the new node (join mode)")
+	port := flag.String("port", ":50051", "Porta do servidor gRPC (ex: :50051, :50052, :50053)")
 	flag.Parse()
+
+	addr := "localhost" + *port
+	if (*port)[0] != ':' {
+		addr = "localhost:" + *port
+	}
+	
+	log.Printf("Conectando em %s...", addr)
 
 	conn, err := grpc.NewClient("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -33,13 +43,15 @@ func main() {
 	ctx := context.Background()
 
 	switch *mode {
-	case "sub":
-		runSubscriber(ctx, client, *topic, *groupID, *shouldAck)
-	case "pub":
-		runPublisher(ctx, client, *topic, *msgContent, *count)
-	default:
-		log.Fatalf("Unknown mode")
-	}
+    case "sub":
+        runSubscriber(ctx, client, *topic, *groupID, *shouldAck)
+    case "pub":
+        runPublisher(ctx, client, *topic, *msgContent, *count)
+    case "join":
+        runJoin(ctx, client, *joinNodeID, *joinAddr)
+    default:
+        log.Fatalf("Unknown mode")
+    }
 }
 
 func runSubscriber(ctx context.Context, client pb.BrokerServiceClient, topic, groupID string, shouldAck bool) {
@@ -107,4 +119,27 @@ func runPublisher(ctx context.Context, client pb.BrokerServiceClient, topic, con
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+func runJoin(ctx context.Context, client pb.BrokerServiceClient, nodeID, addr string) {
+    if nodeID == "" || addr == "" {
+        log.Fatal("Usage: -mode join -join-node <id> -join-addr <host:port>")
+    }
+
+    log.Printf("Requesting Cluster Join: %s @ %s", nodeID, addr)
+    
+    resp, err := client.Join(ctx, &pb.JoinRequest{
+        NodeId:   nodeID,
+        RaftAddr: addr,
+    })
+    
+    if err != nil {
+        log.Fatalf("Join failed: %v", err)
+    }
+    
+    if resp.Success {
+        log.Println("Node successfully joined the cluster!")
+    } else {
+        log.Printf("Join request processed but failed: %s", resp.Error)
+    }
 }

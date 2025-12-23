@@ -10,6 +10,9 @@ service BrokerService {
 
   // Subscribing is a continuous flow of data (Server-Side Streaming).
   rpc Subscribe (stream SubscribeRequest) returns (stream Message);
+
+  //cluster management
+  rpc Join (JoinRequest) returns (JoinResponse);
 }
 
 message PublishRequest {
@@ -33,4 +36,14 @@ message Message {
   string topic = 2;
   bytes payload = 3;
   int64 timestamp = 4;
+}
+
+message JoinRequest {
+  string node_id = 1;   // Ex: "node-2"
+  string raft_addr = 2; // Ex: "localhost:6001" (raft internal address)
+}
+
+message JoinResponse {
+  bool success = 1;
+  string error = 2;
 }

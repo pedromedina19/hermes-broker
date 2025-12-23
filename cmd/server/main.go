@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"log/slog"
 	"net"
 	"net/http"
@@ -20,8 +22,8 @@ import (
 	grpc_adapter "github.com/pedromedina19/hermes-broker/internal/adapters/primary/grpc"
 	http_adapter "github.com/pedromedina19/hermes-broker/internal/adapters/primary/http"
 	"github.com/pedromedina19/hermes-broker/internal/adapters/secondary/config"
+	"github.com/pedromedina19/hermes-broker/internal/adapters/secondary/consensus"
 	"github.com/pedromedina19/hermes-broker/internal/adapters/secondary/memory"
-	"github.com/pedromedina19/hermes-broker/internal/adapters/secondary/persistence"
 	"github.com/pedromedina19/hermes-broker/internal/core/services"
 	"github.com/pedromedina19/hermes-broker/pb"
 )
@@ -30,23 +32,29 @@ func main() {
 	cfg := config.Load()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	
-	logger.Info("Starting Hermes Broker", "config", cfg)
+	logger.Info("Starting Hermes Broker", "node_id", cfg.NodeID, "raft_port", cfg.RaftPort)
 
 	brokerEngine := memory.NewMemoryBroker(cfg.BufferSize, logger)
 
-	wal, err := persistence.NewFileWAL("hermes.wal", logger)
+	fsm := consensus.NewBrokerFSM(brokerEngine, logger)
+
+	raftConf := consensus.RaftConfig{
+		NodeID:    cfg.NodeID,
+		RaftPort:  cfg.RaftPort,
+		DataDir:   cfg.RaftDataDir,
+		Bootstrap: cfg.Bootstrap,
+	}
+	raftNode, err := consensus.NewRaftNode(raftConf, fsm, logger)
 	if err != nil {
-		logger.Error("Failed to initialize WAL", "error", err)
+		logger.Error("Failed to initialize Raft", "error", err)
 		os.Exit(1)
 	}
 	
-	brokerService := services.NewBrokerService(brokerEngine, wal)
+	brokerService := services.NewBrokerService(brokerEngine, raftNode)
 
-	logger.Info("Recovering state from WAL...")
-	if err := brokerService.RecoverState(); err != nil {
-		logger.Error("Failed to recover state", "error", err)
-		// Depending on the criticality, we could either end up with an error or continue empty
-	}
+	if cfg.JoinAddr != "" {
+        go autoJoin(cfg, logger)
+    }
 	
 	grpcListener, err := net.Listen("tcp", cfg.GRPCPort)
 	if err != nil {
@@ -81,17 +89,18 @@ func main() {
 
 	// Mux (default go router)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/publish", restHandler.HandlePublish)           // REST Endpoint
-	mux.Handle("/query", gqlServer)                                 // GraphQL Endpoint
+	mux.HandleFunc("/publish", restHandler.HandlePublish) // REST Endpoint
+	mux.HandleFunc("/join", restHandler.HandleJoin)
+	mux.Handle("/query", gqlServer) // GraphQL Endpoint
 	mux.Handle("/", playground.Handler("GraphQL playground", "/query"))
 
 	httpServer := &http.Server{
-		Addr:    ":8080",
+		Addr:    cfg.HTTPPort,
 		Handler: mux,
 	}
 
 	go func() {
-		logger.Info("HTTP Gateway listening (REST/GraphQL)", "address", ":8080")
+		logger.Info("HTTP Gateway listening (REST/GraphQL)", "address", cfg.HTTPPort)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("HTTP Server error", "error", err)
 		}
@@ -107,7 +116,41 @@ func main() {
 	grpcServer.GracefulStop()
 	httpServer.Close()
 	brokerEngine.Close()
-	wal.Close()
 
 	logger.Info("Hermes Shutdown complete")
+}
+
+func autoJoin(cfg config.Config, logger *slog.Logger) {
+    // Wait a moment to ensure that both the server and the leader are up
+    time.Sleep(2 * time.Second)
+
+    target := "http://" + cfg.JoinAddr + "/join"
+    
+    reqBody := map[string]string{
+        "node_id":   cfg.NodeID,
+        "raft_addr": cfg.RaftPort,
+    }
+    
+    body, _ := json.Marshal(reqBody)
+
+    // Try for 1 minute (Retry with Backoff)
+    for i := 0; i < 10; i++ {
+        logger.Info("Attempting to join cluster...", "target", target)
+        
+        resp, err := http.Post(target, "application/json", bytes.NewBuffer(body))
+        if err == nil && resp.StatusCode == 200 {
+            logger.Info("Successfully joined the cluster!")
+            return
+        }
+
+        if err != nil {
+            logger.Warn("Failed to join cluster (retrying...)", "error", err)
+        } else {
+            logger.Warn("Failed to join cluster (retrying...)", "status", resp.StatusCode)
+        }
+
+        time.Sleep(5 * time.Second)
+    }
+    
+    logger.Error("Could not join cluster after multiple attempts. Running in isolation.")
 }

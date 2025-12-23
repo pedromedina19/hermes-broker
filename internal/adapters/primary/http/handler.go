@@ -10,7 +10,10 @@ import (
 type RestHandler struct {
 	service *services.BrokerService
 }
-
+type JoinRequest struct {
+	NodeID   string `json:"node_id"`
+	RaftAddr string `json:"raft_addr"`
+}
 func NewRestHandler(service *services.BrokerService) *RestHandler {
 	return &RestHandler{service: service}
 }
@@ -46,4 +49,22 @@ func (h *RestHandler) HandlePublish(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func (h *RestHandler) HandleJoin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req JoinRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.service.JoinCluster(req.NodeID, req.RaftAddr); err != nil {
+		http.Error(w, "Failed to join cluster: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }

@@ -2,21 +2,26 @@ package services
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/pedromedina19/hermes-broker/internal/core/domain"
 	"github.com/pedromedina19/hermes-broker/internal/core/ports"
 )
 
+type ConsensusNode interface {
+	ApplyMessage(msg domain.Message) error
+	Join(nodeID, raftAddr string) error
+}
 type BrokerService struct {
 	engine ports.BrokerEngine
-	repo   ports.MessageRepository
+	consensus ConsensusNode
 }
 
-func NewBrokerService(engine ports.BrokerEngine, repo ports.MessageRepository) *BrokerService {
+func NewBrokerService(engine ports.BrokerEngine, consensus ConsensusNode) *BrokerService {
 	return &BrokerService{
-		engine: engine,
-		repo:   repo,
+		engine:    engine,
+		consensus: consensus,
 	}
 }
 
@@ -27,27 +32,13 @@ func (s *BrokerService) Publish(ctx context.Context, topic string, payload []byt
 		Timestamp: time.Now(),
 	}
 
-	// Durability: First we save to disk (WAL)
-	if err := s.repo.Save(msg); err != nil {
-		// If the disk fails, we reject the request cause don't want volatile data
-		return err
+	// RAFT: We send it to consensus
+	// If it's a leader, it replicates and then applies it to the local engine
+	// If it's a follower, it will return a "not leader" error
+	if err := s.consensus.ApplyMessage(msg); err != nil {
+		return fmt.Errorf("consensus error (try leader): %w", err)
 	}
 
-	// Availability: distribute in memory
-	return s.engine.Publish(ctx, msg)
-}
-
-func (s *BrokerService) RecoverState() error {
-	messages, err := s.repo.LoadAll()
-	if err != nil {
-		return err
-	}
-
-	// Replay: Plays everything back into memory engine
-	ctx := context.Background()
-	for _, msg := range messages {
-		_ = s.engine.Publish(ctx, msg)
-	}
 	return nil
 }
 
@@ -56,9 +47,13 @@ func (s *BrokerService) Acknowledge(subID, msgID string) {
 }
 
 func (s *BrokerService) Subscribe(ctx context.Context, topic string, groupID string) (<-chan domain.Message, string, error) {
-    return s.engine.Subscribe(ctx, topic, groupID)
+	return s.engine.Subscribe(ctx, topic, groupID)
 }
 
 func (s *BrokerService) RemoveSubscriber(topic, subID string) {
 	s.engine.Unsubscribe(topic, subID)
+}
+
+func (s *BrokerService) JoinCluster(nodeID, addr string) error {
+	return s.consensus.Join(nodeID, addr)
 }
