@@ -1,47 +1,76 @@
-# Performance Benchmarks
+# Hermes Broker: Performance & Reliability Benchmarks
 
-This document outlines the performance metrics collected during the ingestion of **100,000 user records** via CSV/XLSX.
+This document details the stress tests performed on **Hermes Broker** to validate its processing capacity, resilience in failure scenarios, and efficiency of its communication protocols (**gRPC, REST, and GraphQL**).
 
-## Test Environment
+---
 
-- **Hardware:** Apple M2 (8 Cores)
-- **Database:** PostgreSQL (Docker container)
-- **Dataset:** 100,000 rows (Name, Email, Phone, Document)
+## Results: Comparison by Protocol
 
-## Execution Scenarios
+The tests below were performed with **60 simultaneous workers** for **30 seconds** in a stable 3-node cluster.
 
-We tested two distinct configurations to evaluate throughput and resource management.
+| Protocol | Throughput (msg/sec) | Efficiency | Technical Observation |
+| --- | --- | --- | --- |
+| **gRPC** | **977.32** | **100%** | High performance via **Protobuf** and HTTP/2. |
+| **REST** | **842.68** | ~86% | Serialization overhead **JSON** over HTTP/1.1. |
+| **GraphQL** | **830.43** | ~85% | Similar to REST, with extra schema parsing cost. |
+| **ALL** | **909.53** | ~93% | Mixed load testing all adapters simultaneously. |
 
-### Scenario A: Unconstrained Resources (High Performance)
-Leveraging the full power of the host machine without Docker CPU limits.
+---
 
-- **Workers:** 80 concurrent workers
-- **Broker Buffer:** 80,000 messages
-- **Total Time:** ~30 seconds
-- **Throughput:** ~3,333 inserts/second
+## How to Run the Benchmarks
 
-### Scenario B: Production Simulation (Limited Resources)
-Simulating a cloud environment (e.g., GCP e2-medium) by limiting the Database container to **1 vCPU**.
+The benchmark executable is located at `cmd/benchmark/main.go`. It allows configuring the stress level, duration, and system behavior.
 
-- **Workers:** 30 concurrent workers (Optimized)
-- **Broker Buffer:** 20,000 messages
-- **Total Time:** ~41 seconds
-- **Throughput:** ~2,439 inserts/second
+### Basic Command
 
-*Note: Increasing workers to 80 in this limited scenario degraded performance to 55 seconds due to CPU thrashing and context switching.*
+```bash
+go run cmd/benchmark/main.go -workers 60 -duration 30s -protocol=grpc -scenario=live
+```
 
-## Resource Consumption
+### Available Flags
 
-The following table represents the resource usage of each microservice during the peak load of processing 100,000 records.
+* `-workers`: Number of goroutines firing messages (default: 60).
+* `-duration`: Total sending time (e.g., `15s`, `1m`).
+* `-protocol`: Choose between `grpc`, `rest`, `graphql`, or `all`.
+* `-scenario`: Defines the test behavior (see below).
+* `-grpc-targets`: List of gRPC cluster IPs/Ports (csv).
+* `-http-targets`: List of HTTP cluster IPs/Ports (csv).
 
-| Service | Component Role | Memory Usage (Alloc) | Goroutines (Peak) | Performance Behavior |
-| :--- | :--- | :--- | :--- | :--- |
-| **Janus** | Gateway / Validation | ~29 MiB | 18 | Stable memory usage due to stream processing. |
-| **Hermes** | Message Broker | ~18 MiB (Peak) | 21 | High allocation turnover due to message passing. |
-| **Hephaestus** | Worker / DB Writer | ~6 MiB | 73 | Extremely low memory footprint due to batch flushing. |
+---
 
-## Key Findings
+## Test Scenarios
 
-1.  **Memory Efficiency:** The entire architecture (3 services) consumed less than **100 MiB** of actual RAM (Alloc) to process the dataset, proving the efficiency of Go's memory management and garbage collector.
-2.  **Backpressure:** The system successfully handled backpressure. When the Database reached 100% CPU usage (in Scenario B), the Broker buffer filled up, causing the Gateway to slow down reading, preventing data loss.
-3.  **Concurrency Limit:** More workers do not always equal higher speed. In a 1 vCPU database environment, 30 workers performed 25% faster than 80 workers by reducing lock contention and context switching.
+The benchmark doesn't just test speed, but also the **robustness** of the hybrid engine:
+
+| Scenario | Description | What does it validate? |
+| --- | --- | --- |
+| `live` | Subscriber consumes in real-time via RAM. | **Memory Bypass** and minimum latency. |
+| `slow` | Artificially slow subscriber (2ms delay). | **Backpressure** and disk persistence (BoltDB). |
+| `crash` | Subscriber dies halfway through and resurfaces. | **Consumer Groups** and Offset persistence. |
+| `isolation` | Messages sent to Topic A and B simultaneously. | **Routing** and logical data isolation. |
+| `disk` | Subscriber only starts after publications end. | Complete **Recovery** from physical storage. |
+
+---
+
+## Resilience Analysis (High Availability)
+
+During the `slow` scenario, we performed the **Leader Kill** test (killing the leader node while the backlog is being processed).
+
+### Technical Observations:
+
+* **Transparent Failover:** The Auditor (Subscriber) detected the gRPC stream failure and reconnected to a follower automatically.
+* **Raft Consistency:** The new leader assumed the offset of the `ha-slow-group` group and continued delivery from the last replicated point.
+* **At-Least-Once Guarantee:** In some failure cases, the total `Received` messages may be slightly higher than those `Published`. This proves that the system prefers to resend a message rather than lose data during the election of a new leader.
+
+> [!IMPORTANT]
+> **Idempotency:** Since Hermes guarantees at-least-once delivery, it is recommended that consumers handle duplicate messages based on the `message_id`.
+
+---
+
+## Conclusions
+
+1. **Binary Efficiency:** gRPC proved to be ~15% more efficient than text-based protocols (JSON), being the ideal choice for inter-service communication.
+2. **Hybrid Engine:** BoltDB integrated with Raft allows the Broker to accept loads far exceeding consumer processing capacity, safely storing the excess.
+3. **Smart Proxy:** The implementation of the internal proxy in the server ensures that the client doesn't need to know the cluster topology, being able to hit any node to publish data.
+
+---

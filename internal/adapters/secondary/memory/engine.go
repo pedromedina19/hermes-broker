@@ -3,21 +3,25 @@ package memory
 import (
 	"context"
 	"hash/fnv"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pedromedina19/hermes-broker/internal/adapters/secondary/storage"
 	"github.com/pedromedina19/hermes-broker/internal/core/domain"
 	"github.com/pedromedina19/hermes-broker/internal/core/ports"
 )
 
 const (
-	AckTimeout = 5 * time.Second
+	AckTimeout = 60 * time.Second
 	MaxRetries = 3
 	DlqTopic   = "hermes.dlq"
 
-	// to reduce lock containment
-	ShardCount = 32
+	BatchSize  = 1000 // Reads large blocks of the disc.
+	ShardCount = 64   // to reduce ACK lock contention
+	ChannelBuf = 5000 // Output channel buffer
 )
 
 type PendingMessage struct {
@@ -26,63 +30,56 @@ type PendingMessage struct {
 }
 
 type Subscriber struct {
-	ID      string
-	GroupID string
-	Channel chan domain.Message
+	ID            string
+	GroupID       string
+	Channel       chan domain.Message
+	CurrentOffset uint64
+	quit          chan struct{}
+	// BYPASS: Channel for receiving "hot" data directly from Publish
+	liveChan chan domain.Message
 }
 
-type GroupRoundRobin struct {
-	subIDs []string
-	next   int
-}
-
-// TopicShard protects subscriber and group tree.
-type TopicShard struct {
-	mu          sync.RWMutex
-	subscribers map[string]map[string]*Subscriber      // topic -> subID -> sub
-	groupStates map[string]map[string]*GroupRoundRobin // topic -> groupID -> state
-}
-
-// AckShard protects pending issues
 type AckShard struct {
 	mu          sync.RWMutex
-	pendingAcks map[string]map[string]*PendingMessage // subID -> msgID -> Pending
+	pendingAcks map[string]map[string]*PendingMessage
 }
 
-type MemoryBroker struct {
-	topicShards []*TopicShard
-	ackShards   []*AckShard
+type HybridBroker struct {
+	store ports.LocalLogStore
 
-	bufferSize int
-	logger     ports.Logger
+	subsMu sync.RWMutex
+	subs   map[string]map[string]*Subscriber
 
+	ackShards []*AckShard
+
+	logger ports.Logger
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
-func NewMemoryBroker(bufferSize int, logger ports.Logger) *MemoryBroker {
+func NewHybridBroker(dataDir string, bufferSize int, logger ports.Logger) *HybridBroker {
+	storePath := filepath.Join(dataDir, "messages.db")
+	store, err := storage.NewBoltLogStore(storePath)
+	if err != nil {
+		panic(err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
-	tShards := make([]*TopicShard, ShardCount)
 	aShards := make([]*AckShard, ShardCount)
-
 	for i := 0; i < ShardCount; i++ {
-		tShards[i] = &TopicShard{
-			subscribers: make(map[string]map[string]*Subscriber),
-			groupStates: make(map[string]map[string]*GroupRoundRobin),
-		}
 		aShards[i] = &AckShard{
 			pendingAcks: make(map[string]map[string]*PendingMessage),
 		}
 	}
 
-	broker := &MemoryBroker{
-		topicShards: tShards,
-		ackShards:   aShards,
-		bufferSize:  bufferSize,
-		logger:      logger,
-		ctx:         ctx,
-		cancel:      cancel,
+	broker := &HybridBroker{
+		store:     store,
+		subs:      make(map[string]map[string]*Subscriber),
+		ackShards: aShards,
+		logger:    logger,
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 
 	go broker.redeliveryLoop()
@@ -90,115 +87,199 @@ func NewMemoryBroker(bufferSize int, logger ports.Logger) *MemoryBroker {
 	return broker
 }
 
-func getShardIndex(key string) uint32 {
+func (b *HybridBroker) getAckShard(subID string) *AckShard {
 	h := fnv.New32a()
-	h.Write([]byte(key))
-	return h.Sum32() % ShardCount
+	h.Write([]byte(subID))
+	idx := h.Sum32() % uint32(ShardCount)
+	return b.ackShards[idx]
 }
 
-func (b *MemoryBroker) getTopicShard(topic string) *TopicShard {
-	return b.topicShards[getShardIndex(topic)]
-}
-
-func (b *MemoryBroker) getAckShard(subID string) *AckShard {
-	return b.ackShards[getShardIndex(subID)]
-}
-
-func (b *MemoryBroker) Publish(ctx context.Context, msg domain.Message) error {
-	shard := b.getTopicShard(msg.Topic)
-
-	// need full locking of the Shard to ensure RoundRobin consistency
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	subs, ok := shard.subscribers[msg.Topic]
-	if !ok || len(subs) == 0 {
-		return nil
-	}
-
+func (b *HybridBroker) Publish(ctx context.Context, msg domain.Message) error {
 	if msg.ID == "" {
 		msg.ID = uuid.New().String()
 	}
 
-	groupsProcessed := make(map[string]bool)
-
-	for _, sub := range subs {
-		targetSub := sub
-
-		// Round-Robin Logic
-		if sub.GroupID != "" {
-			if groupsProcessed[sub.GroupID] {
-				continue
-			}
-			groupsProcessed[sub.GroupID] = true
-
-			// Internal logic of RR accessing the groupStates map of the same Shard
-			targetID := b.getNextRoundRobinSubUnsafe(shard, msg.Topic, sub.GroupID)
-			if targetID != "" {
-				if s, exists := subs[targetID]; exists {
-					targetSub = s
-				}
-			}
-		}
-
-		msgToSend := msg
-		select {
-		case targetSub.Channel <- msgToSend:
-			b.trackPending(targetSub.ID, msgToSend)
-		default:
-			b.logger.Warn("Dropped (Buffer Full)", "sub", targetSub.ID)
-		}
+	// Persistence
+	_, err := b.store.Append(msg)
+	if err != nil {
+		return err
 	}
+
+	// Bypass (Fast Delivery)
+	b.broadcastToMemory(msg)
+
 	return nil
 }
 
-func (b *MemoryBroker) getNextRoundRobinSubUnsafe(shard *TopicShard, topic, groupID string) string {
-	if states, ok := shard.groupStates[topic]; ok {
-		if state, ok := states[groupID]; ok {
-			if len(state.subIDs) == 0 {
-				return ""
+func (b *HybridBroker) broadcastToMemory(msg domain.Message) {
+	b.subsMu.RLock()
+	defer b.subsMu.RUnlock()
+
+	if subs, ok := b.subs[msg.Topic]; ok {
+		for _, sub := range subs {
+			select {
+			case sub.liveChan <- msg:
+			default:
+				// Buffer full, we drop it silently. The sub will pick it up from disk
 			}
-			id := state.subIDs[state.next]
-			state.next = (state.next + 1) % len(state.subIDs)
-			return id
 		}
 	}
-	return ""
 }
 
-func (b *MemoryBroker) trackPending(subID string, msg domain.Message) {
+func (b *HybridBroker) Subscribe(ctx context.Context, topic string, groupID string) (<-chan domain.Message, string, error) {
+	b.subsMu.Lock()
+	defer b.subsMu.Unlock()
+
+	if _, ok := b.subs[topic]; !ok {
+		b.subs[topic] = make(map[string]*Subscriber)
+	}
+
+	ch := make(chan domain.Message, ChannelBuf)
+	subID := uuid.New().String()
+
+	var startOffset uint64
+
+	switch groupID {
+	case "":
+		startOffset = b.store.LastOffset(topic) + 1
+	case "__REPLAY__":
+		startOffset = 0
+	default:
+		savedOffset, err := b.store.GetOffset(topic, groupID)
+		if err != nil || savedOffset == 0 {
+			startOffset = 0
+		} else {
+			startOffset = savedOffset + 1
+		}
+	}
+
+	liveChan := make(chan domain.Message, 5000)
+
+	sub := &Subscriber{
+		ID:            subID,
+		GroupID:       groupID,
+		Channel:       ch,
+		CurrentOffset: startOffset,
+		quit:          make(chan struct{}),
+		liveChan:      liveChan,
+	}
+
+	b.subs[topic][subID] = sub
+	b.logger.Info("Subscriber connected", "id", subID, "start_offset", startOffset, "group", groupID)
+
+	go b.runSubscriberPump(sub, topic)
+
+	return ch, subID, nil
+}
+
+func (b *HybridBroker) runSubscriberPump(sub *Subscriber, topic string) {
+	// Auto-Commit
+	commitTicker := time.NewTicker(1 * time.Second)
+	defer commitTicker.Stop()
+
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case <-sub.quit:
+			return
+
+		case <-commitTicker.C:
+			if sub.GroupID != "" && sub.GroupID != "__REPLAY__" {
+				b.store.SaveOffset(topic, sub.GroupID, sub.CurrentOffset-1)
+			}
+
+		// HOT PATH: Try reading from memory first
+		case msg := <-sub.liveChan:
+			select {
+			case sub.Channel <- msg:
+				b.trackPending(sub.ID, msg)
+				sub.CurrentOffset++
+			case <-b.ctx.Done():
+				return
+			case <-sub.quit:
+				return
+			}
+			continue
+
+		default:
+		}
+
+		// COLD PATH: Checks if we are behind schedule with the disk
+		lastOffset := b.store.LastOffset(topic)
+		if lastOffset >= sub.CurrentOffset {
+			processedCount := b.processFromDisk(sub, topic)
+			if processedCount > 0 {
+				drainChannel(sub.liveChan)
+				runtime.Gosched()
+				continue
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (b *HybridBroker) processFromDisk(sub *Subscriber, topic string) int {
+	msgs, nextOffset, err := b.store.ReadBatch(topic, sub.CurrentOffset, BatchSize)
+	if err != nil {
+		b.logger.Error("Disk Read Error", "err", err)
+		return 0
+	}
+
+	if len(msgs) == 0 {
+		return 0
+	}
+
+	for _, msg := range msgs {
+		select {
+		case sub.Channel <- msg:
+			b.trackPending(sub.ID, msg)
+		case <-b.ctx.Done():
+			return 0
+		case <-sub.quit:
+			return 0
+		}
+	}
+
+	sub.CurrentOffset = nextOffset
+	return len(msgs)
+}
+
+func drainChannel(ch <-chan domain.Message) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+func (b *HybridBroker) trackPending(subID string, msg domain.Message) {
 	shard := b.getAckShard(subID)
 	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
 	if _, ok := shard.pendingAcks[subID]; !ok {
 		shard.pendingAcks[subID] = make(map[string]*PendingMessage)
 	}
-
 	shard.pendingAcks[subID][msg.ID] = &PendingMessage{
 		Msg:    msg,
 		SentAt: time.Now(),
 	}
+	shard.mu.Unlock()
 }
 
-func (b *MemoryBroker) Acknowledge(subID, msgID string) {
+func (b *HybridBroker) Acknowledge(subID, msgID string) {
 	shard := b.getAckShard(subID)
 	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
 	if msgs, ok := shard.pendingAcks[subID]; ok {
-		if pending, exists := msgs[msgID]; exists {
-			latency := time.Since(pending.SentAt)
-			delete(msgs, msgID)
-			b.logger.Info("ACK Received", "sub", subID, "latency", latency, "attempts", pending.Msg.DeliveryAttempts)
-		}
+		delete(msgs, msgID)
 	}
+	shard.mu.Unlock()
 }
 
-func (b *MemoryBroker) redeliveryLoop() {
-	ticker := time.NewTicker(1 * time.Second)
+func (b *HybridBroker) redeliveryLoop() {
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-b.ctx.Done():
@@ -209,43 +290,33 @@ func (b *MemoryBroker) redeliveryLoop() {
 	}
 }
 
-func (b *MemoryBroker) checkPendingMessages() {
+func (b *HybridBroker) checkPendingMessages() {
 	now := time.Now()
-	// processes each shard independently so it doesn`t block everything
 	for _, shard := range b.ackShards {
 		b.processAckShard(shard, now)
 	}
 }
 
-func (b *MemoryBroker) processAckShard(shard *AckShard, now time.Time) {
-	// Auxiliar structure to prevent holding the lock during retransmission
+func (b *HybridBroker) processAckShard(shard *AckShard, now time.Time) {
 	type retryItem struct {
 		subID string
 		msg   domain.Message
 	}
 
 	shard.mu.Lock()
-
 	var retries []retryItem
 	var dlqs []domain.Message
 
-	// Identify what needs to be done under Lock.
 	for subID, msgs := range shard.pendingAcks {
 		for msgID, pending := range msgs {
 			if now.Sub(pending.SentAt) > AckTimeout {
 				pending.Msg.DeliveryAttempts++
-
 				if pending.Msg.DeliveryAttempts > MaxRetries {
-					b.logger.Error("Message Dead (Max Retries)", "msgID", msgID, "sub", subID)
 					dlqs = append(dlqs, pending.Msg)
 					delete(msgs, msgID)
 					continue
 				}
-
-				b.logger.Warn("Redelivering message...", "msgID", msgID, "attempt", pending.Msg.DeliveryAttempts)
-				pending.SentAt = now // timer reset
-
-				// Add to temporary list to process AFTER Unlock
+				pending.SentAt = now
 				retries = append(retries, retryItem{subID: subID, msg: pending.Msg})
 			}
 		}
@@ -255,40 +326,33 @@ func (b *MemoryBroker) processAckShard(shard *AckShard, now time.Time) {
 	for _, item := range retries {
 		b.sendDirect(item.subID, item.msg)
 	}
-
 	for _, msg := range dlqs {
 		b.moveToDLQ(msg)
 	}
 }
 
-func (b *MemoryBroker) sendDirect(subID string, msg domain.Message) {
-	shard := b.getTopicShard(msg.Topic)
+func (b *HybridBroker) sendDirect(subID string, msg domain.Message) {
+	b.subsMu.RLock()
+	defer b.subsMu.RUnlock()
 
-	shard.mu.RLock()
-	defer shard.mu.RUnlock()
-
-	if subs, ok := shard.subscribers[msg.Topic]; ok {
-		if sub, ok := subs[subID]; ok {
+	if topicSubs, ok := b.subs[msg.Topic]; ok {
+		if sub, ok := topicSubs[subID]; ok {
 			select {
 			case sub.Channel <- msg:
-				// success
 			default:
-				// full channel
 			}
 		}
 	}
 }
 
-func (b *MemoryBroker) moveToDLQ(msg domain.Message) {
+func (b *HybridBroker) moveToDLQ(msg domain.Message) {
 	dlqMsg := msg
 	dlqMsg.Topic = DlqTopic
 	dlqMsg.ID = "dlq-" + msg.ID
 
-	shard := b.getTopicShard(DlqTopic)
-	shard.mu.RLock()
-	defer shard.mu.RUnlock()
-
-	if subs, ok := shard.subscribers[DlqTopic]; ok {
+	b.subsMu.RLock()
+	defer b.subsMu.RUnlock()
+	if subs, ok := b.subs[DlqTopic]; ok {
 		for _, sub := range subs {
 			select {
 			case sub.Channel <- dlqMsg:
@@ -298,111 +362,32 @@ func (b *MemoryBroker) moveToDLQ(msg domain.Message) {
 	}
 }
 
-func (b *MemoryBroker) Subscribe(ctx context.Context, topic string, groupID string) (<-chan domain.Message, string, error) {
-	shard := b.getTopicShard(topic)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
+func (b *HybridBroker) Unsubscribe(topic string, subID string) {
+	b.subsMu.Lock()
+	defer b.subsMu.Unlock()
 
-	if _, ok := shard.subscribers[topic]; !ok {
-		shard.subscribers[topic] = make(map[string]*Subscriber)
-	}
-
-	if _, ok := shard.groupStates[topic]; !ok {
-		shard.groupStates[topic] = make(map[string]*GroupRoundRobin)
-	}
-
-	ch := make(chan domain.Message, b.bufferSize)
-	subID := uuid.New().String()
-
-	shard.subscribers[topic][subID] = &Subscriber{
-		ID:      subID,
-		GroupID: groupID,
-		Channel: ch,
-	}
-
-	if groupID != "" {
-		if _, ok := shard.groupStates[topic][groupID]; !ok {
-			shard.groupStates[topic][groupID] = &GroupRoundRobin{
-				subIDs: make([]string, 0),
-				next:   0,
-			}
-		}
-		shard.groupStates[topic][groupID].subIDs = append(shard.groupStates[topic][groupID].subIDs, subID)
-	}
-
-	// Pre-allocate the map in AckShard to avoid a null check later
-	ackShard := b.getAckShard(subID)
-	ackShard.mu.Lock()
-	if _, ok := ackShard.pendingAcks[subID]; !ok {
-		ackShard.pendingAcks[subID] = make(map[string]*PendingMessage)
-	}
-	ackShard.mu.Unlock()
-
-	b.logger.Info("New subscriber added", "topic", topic, "id", subID, "group", groupID)
-	return ch, subID, nil
-}
-
-func (b *MemoryBroker) Unsubscribe(topic string, subID string) {
-	shard := b.getTopicShard(topic)
-	shard.mu.Lock()
-
-	if subs, ok := shard.subscribers[topic]; ok {
-		if sub, exists := subs[subID]; exists {
-			if sub.GroupID != "" {
-				b.removeFromGroupState(shard, topic, sub.GroupID, subID)
+	if m, ok := b.subs[topic]; ok {
+		if sub, ok := m[subID]; ok {
+			select {
+			case <-sub.quit:
+			default:
+				close(sub.quit)
 			}
 			close(sub.Channel)
-			delete(subs, subID)
-		}
-		if len(subs) == 0 {
-			delete(shard.subscribers, topic)
-			delete(shard.groupStates, topic)
+			delete(m, subID)
 		}
 	}
+
+	shard := b.getAckShard(subID)
+	shard.mu.Lock()
+	delete(shard.pendingAcks, subID)
 	shard.mu.Unlock()
 
-	ackShard := b.getAckShard(subID)
-	ackShard.mu.Lock()
-	delete(ackShard.pendingAcks, subID)
-	ackShard.mu.Unlock()
-
-	b.logger.Info("Subscriber removed", "topic", topic, "id", subID)
+	b.logger.Info("Subscriber removed gracefully", "topic", topic, "id", subID)
 }
 
-func (b *MemoryBroker) removeFromGroupState(shard *TopicShard, topic, groupID, subID string) {
-	if states, ok := shard.groupStates[topic]; ok {
-		if state, ok := states[groupID]; ok {
-			for i, id := range state.subIDs {
-				if id == subID {
-					state.subIDs = append(state.subIDs[:i], state.subIDs[i+1:]...)
-					if i < state.next {
-						state.next--
-					}
-					if state.next >= len(state.subIDs) {
-						state.next = 0
-					}
-					break
-				}
-			}
-			if len(state.subIDs) == 0 {
-				delete(states, groupID)
-			}
-		}
-	}
-}
-
-func (b *MemoryBroker) Close() {
+func (b *HybridBroker) Close() {
 	b.cancel()
-
-	for _, shard := range b.topicShards {
-		shard.mu.Lock()
-		for _, subs := range shard.subscribers {
-			for _, sub := range subs {
-				close(sub.Channel)
-			}
-		}
-		shard.mu.Unlock()
-	}
-
-	b.logger.Info("Memory Broker engine shutdown complete")
+	b.store.Close()
+	b.logger.Info("Hybrid Broker shutdown complete")
 }

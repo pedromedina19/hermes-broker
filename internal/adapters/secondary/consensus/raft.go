@@ -41,9 +41,13 @@ func NewRaftNode(conf RaftConfig, fsm *BrokerFSM, logger *slog.Logger) (*RaftNod
 	})
 	config.Logger = raftLogger
 	config.LocalID = raft.ServerID(conf.NodeID)
-	config.HeartbeatTimeout = 1000 * time.Millisecond
-	config.ElectionTimeout = 1000 * time.Millisecond
-	config.CommitTimeout = 500 * time.Millisecond
+	config.HeartbeatTimeout = 500 * time.Millisecond
+	config.ElectionTimeout = 500 * time.Millisecond
+	config.CommitTimeout = 50 * time.Millisecond
+	config.SnapshotThreshold = 1024
+    config.SnapshotInterval = 120 * time.Second
+	config.TrailingLogs = 1024
+
 
 	addr, err := net.ResolveTCPAddr("tcp", conf.RaftPort)
 	if err != nil {
@@ -123,4 +127,13 @@ func (rn *RaftNode) Join(nodeID, raftAddr string) error {
 		return err
 	}
 	return nil
+}
+
+func (rn *RaftNode) GetLeaderAddr() string {
+	_, id := rn.Raft.LeaderWithID()
+	return string(id)
+}
+
+func (rn *RaftNode) IsLeader() bool {
+	return rn.Raft.State() == raft.Leader
 }

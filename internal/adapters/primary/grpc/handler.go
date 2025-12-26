@@ -28,7 +28,7 @@ func (h *GrpcHandler) Publish(ctx context.Context, req *pb.PublishRequest) (*pb.
 	err := h.service.Publish(ctx, req.Topic, req.Payload)
 	if err != nil {
 		h.logger.Error("Failed to publish", "error", err)
-		return &pb.PublishResponse{Success: false}, status.Error(codes.Internal, "Failed to publish")
+		return &pb.PublishResponse{Success: false}, status.Error(codes.Internal, err.Error())
 	}
 	return &pb.PublishResponse{Success: true}, nil
 }

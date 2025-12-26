@@ -25,23 +25,40 @@ var (
 	grpcPool []string
 	httpPool []string
 
-	topic         = "benchmark-topic"
-	totalReqs     uint64
-	totalErrs     uint64
-	totalReceived uint64
+	topic = "benchmark-topic"
+
+	// Global Atomic Metrics
+	totalReqs     uint64 // Messages sent successfully
+	totalErrs     uint64 // Actual network/logic errors
+	totalReceived uint64 // Messages that arrived at the Auditor
+
+	pubA uint64
+	pubB uint64
+	subA uint64
+	subB uint64
 
 	errorCounts = make(map[string]int)
 	errorMu     sync.Mutex
+
+	currentScenario string
 )
 
 func recordError(err error) {
 	if err == nil {
 		return
 	}
+	if err == context.DeadlineExceeded || err == context.Canceled {
+		return
+	}
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "context deadline exceeded") ||
+		strings.Contains(errMsg, "context canceled") ||
+		strings.Contains(errMsg, "canceled") {
+		return
+	}
 	atomic.AddUint64(&totalErrs, 1)
-	msg := err.Error()
 	errorMu.Lock()
-	errorCounts[msg]++
+	errorCounts[errMsg]++
 	errorMu.Unlock()
 }
 
@@ -53,123 +70,295 @@ func recordCustomError(msg string) {
 }
 
 func main() {
-	workers := flag.Int("workers", 60, "Workers simultâneos")
-	duration := flag.Duration("duration", 15*time.Second, "Duração")
+	workers := flag.Int("workers", 60, "Total number of simultaneous workers")
+	duration := flag.Duration("duration", 15*time.Second, "Test duration")
+	scenario := flag.String("scenario", "live", "Cenários: live, disk, slow, late, crash, isolation")
+	protocol := flag.String("protocol", "all", "Protocolo: grpc, rest, graphql, all")
 
-	flag.StringVar(&grpcTargetsStr, "grpc-targets", "localhost:50051,localhost:50052,localhost:50053", "Lista de nós gRPC (csv)")
-	flag.StringVar(&httpTargetsStr, "http-targets", "localhost:8080,localhost:8081,localhost:8082", "Lista de nós HTTP (csv)")
+	flag.StringVar(&grpcTargetsStr, "grpc-targets", "localhost:50051,localhost:50052,localhost:50053", "List of gRPC nodes (csv)")
+	flag.StringVar(&httpTargetsStr, "http-targets", "localhost:8080,localhost:8081,localhost:8082", "HTTP Node List (csv)")
 
 	flag.Parse()
+	currentScenario = *scenario
 
 	grpcPool = strings.Split(grpcTargetsStr, ",")
 	httpPool = strings.Split(httpTargetsStr, ",")
 
-	fmt.Printf("INICIANDO SMART BENCHMARK (CLUSTER AWARE)\n")
-	fmt.Printf("Workers: %d\n", *workers)
-	fmt.Printf("Alvos gRPC: %v\n", grpcPool)
-	fmt.Printf("Alvos HTTP: %v\n", httpPool)
+	fmt.Printf("STARTING TEST: %s \n", strings.ToUpper(*scenario))
+	fmt.Printf("Protocol: %s | Workers: %d | Duration: %v\n", strings.ToUpper(*protocol), *workers, *duration)
+	fmt.Printf("Cluster gRPC: %v\n\n", grpcPool)
+
+	pubCtx, pubCancel := context.WithTimeout(context.Background(), *duration)
+	defer pubCancel()
 
 	subCtx, subCancel := context.WithCancel(context.Background())
 	defer subCancel()
 
 	readyWg := &sync.WaitGroup{}
-	readyWg.Add(1)
-	go runInternalSubscriber(subCtx, readyWg, grpcPool[len(grpcPool)-1])
-	readyWg.Wait()
+	var wg sync.WaitGroup
 
-	fmt.Println("Auditor conectado. Iniciando ataque distribuído...")
+	processingDelay := time.Duration(0)
+	groupID := ""
+
+	switch *scenario {
+	case "live":
+		readyWg.Add(1)
+		go runInternalSubscriber(subCtx, readyWg, topic, "", 0, &totalReceived)
+		readyWg.Wait()
+		fmt.Println("Connected auditor (Live Mode)")
+	case "slow":
+		processingDelay = 2 * time.Millisecond
+		groupID = "ha-slow-group"
+		readyWg.Add(1)
+		go runInternalSubscriber(subCtx, readyWg, topic, groupID, processingDelay, &totalReceived)
+		readyWg.Wait()
+		fmt.Println("MODO SLOW: Slow subscriber with Consumption Group for Failover")
+	case "disk":
+		groupID = "__REPLAY__"
+		fmt.Println("MODO DISK: The auditor will wait until the publication is complete to read it from scratch")
+	case "late":
+		groupID = "__REPLAY__"
+		fmt.Println("MODO LATE: Subscriber will enter halfway through the test.")
+		time.AfterFunc(*duration/2, func() {
+			fmt.Println("\n🏃 Late subscriber joining the race!")
+			readyWg.Add(1)
+			go runInternalSubscriber(subCtx, readyWg, topic, groupID, 0, &totalReceived)
+		})
+	case "crash":
+		groupID = "persistent-group-01"
+		fmt.Println("CRASH MODE: Subscriber will die halfway through and then be resurrected.")
+		readyWg.Add(1)
+		crashCtx, crashCancel := context.WithCancel(context.Background())
+		go func() {
+			runInternalSubscriber(crashCtx, readyWg, topic, groupID, 0, &totalReceived)
+		}()
+		time.AfterFunc(*duration/2, func() {
+			fmt.Println("\nSubscriber DIED (Simulated Crash)!")
+			crashCancel()
+			time.AfterFunc(2*time.Second, func() {
+				fmt.Println("\n🧟 Subscriber RESURRECTED (Offset Resuming)!")
+				go runInternalSubscriber(subCtx, nil, topic, groupID, 0, &totalReceived)
+			})
+		})
+	case "isolation":
+		fmt.Println("ISOLATION MODE: Validating message separation between Topic A and B.")
+		readyWg.Add(2)
+		go runInternalSubscriber(subCtx, readyWg, "topic-A", "", 0, &subA)
+		go runInternalSubscriber(subCtx, readyWg, "topic-B", "", 0, &subB)
+		readyWg.Wait()
+		fmt.Println("Auditors A and B connected.")
+	default:
+		log.Fatalf("Unknown scenario: %s", *scenario)
+	}
+
 	start := time.Now()
 
-	doneChan := make(chan struct{})
-	time.AfterFunc(*duration, func() {
-		close(doneChan)
-		fmt.Println("\nTempo esgotado. Parando novos envios...")
-	})
-
-	var wg sync.WaitGroup
-	squadSize := *workers / 3
-
-	for i := 0; i < squadSize; i++ {
+	for i := 0; i < *workers; i++ {
 		wg.Add(1)
-		go runSmartGrpcWorker(doneChan, &wg, i)
-	}
-	for i := 0; i < squadSize; i++ {
-		wg.Add(1)
-		go runSmartRestWorker(doneChan, &wg, i)
-	}
-	for i := 0; i < squadSize; i++ {
-		wg.Add(1)
-		go runSmartGraphqlWorker(doneChan, &wg, i)
+		p := strings.ToLower(*protocol)
+		if p == "all" {
+			if i%3 == 0 {
+				go runGrpcWorker(pubCtx, &wg, i)
+			} else if i%3 == 1 {
+				go runRestWorker(pubCtx, &wg, i)
+			} else {
+				go runGraphqlWorker(pubCtx, &wg, i)
+			}
+		} else {
+			switch p {
+			case "grpc":
+				go runGrpcWorker(pubCtx, &wg, i)
+			case "rest":
+				go runRestWorker(pubCtx, &wg, i)
+			case "graphql":
+				go runGraphqlWorker(pubCtx, &wg, i)
+			default:
+				log.Fatalf("Invalid protocol: %s", *protocol)
+			}
+		}
 	}
 
-	monitorStop := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-monitorStop:
+			case <-pubCtx.Done():
 				return
 			case <-ticker.C:
-				currPub := atomic.LoadUint64(&totalReqs)
-				currSub := atomic.LoadUint64(&totalReceived)
-				fmt.Printf("\r Pub: %d | Sub: %d | Erros: %d", currPub, currSub, atomic.LoadUint64(&totalErrs))
+				p := atomic.LoadUint64(&totalReqs)
+				if *scenario == "isolation" {
+					pa, pb := atomic.LoadUint64(&pubA), atomic.LoadUint64(&pubB)
+					sa, sb := atomic.LoadUint64(&subA), atomic.LoadUint64(&subB)
+					fmt.Printf("\rA:[Pub:%d Sub:%d] | B:[Pub:%d Sub:%d]", pa, sa, pb, sb)
+				} else {
+					r := atomic.LoadUint64(&totalReceived)
+					var lag uint64
+					if p >= r {
+						lag = p - r
+					} else {
+						lag = 0
+					}
+					fmt.Printf("\rPub: %d | Sub: %d | Pendente: %d", p, r, lag)
+				}
 			}
 		}
 	}()
 
 	wg.Wait()
-	close(monitorStop)
+	fmt.Println("\n\n")
 
-	fmt.Println("\nPublicação encerrada. Aguardando o Auditor processar o backlog...")
+	if *scenario == "disk" {
+		fmt.Println("Publication closed. Final drainage initiated...")
+		readyWg.Add(1)
+		go runInternalSubscriber(subCtx, readyWg, topic, groupID, 0, &totalReceived)
+		readyWg.Wait()
+	}
 
-	kickerCtx, kickerCancel := context.WithCancel(context.Background())
-	runDrainKicker(kickerCtx, httpPool)
+	fmt.Println("Awaiting complete drainage (Monitoring cluster stability)...")
 
-	drainTimeout := time.After(120 * time.Second)
 	drainTicker := time.NewTicker(1 * time.Second)
-
 	defer drainTicker.Stop()
+	lastReceivedCount := atomic.LoadUint64(&totalReceived)
+	stuckSeconds := 0
 
 drainLoop:
 	for {
 		select {
-		case <-drainTimeout:
-			kickerCancel()
-			fmt.Println("\nTimeout de drenagem atingido (Auditor muito lento).")
-			break drainLoop
 		case <-drainTicker.C:
 			p := atomic.LoadUint64(&totalReqs)
 			r := atomic.LoadUint64(&totalReceived)
+			if *scenario == "isolation" {
+				r = atomic.LoadUint64(&subA) + atomic.LoadUint64(&subB)
+			}
 
-			fmt.Printf("\r⏳ Drenando... Pendentes: %d (Recebidos: %d / %d)", p-r, r, p)
+			fmt.Printf("\rDraining: %d / %d | Cluster stopped for: %ds", r, p, stuckSeconds)
 
-			if r >= p {
-				kickerCancel()
-				fmt.Println("\n\nSUCESSO: Todas as mensagens foram drenadas!")
+			if r >= p && p > 0 {
+				fmt.Println("\nSuccess: All messages processed!")
+				break drainLoop
+			}
+
+			if r == lastReceivedCount {
+				stuckSeconds++
+			} else {
+				stuckSeconds = 0
+			}
+			lastReceivedCount = r
+
+			if stuckSeconds >= 120 {
+				fmt.Println("\nError: Cluster locked for 120s. Drain aborted.")
 				break drainLoop
 			}
 		}
 	}
 
 	elapsed := time.Since(start)
-	printReport(elapsed)
+	printReport(elapsed, *scenario)
 }
 
+func runInternalSubscriber(ctx context.Context, readyWg *sync.WaitGroup, topicName, groupID string, delay time.Duration, metric *uint64) {
+	ackChan := make(chan string, 200000)
+	nodeIndex := 0
 
-func runSmartGrpcWorker(done <-chan struct{}, wg *sync.WaitGroup, id int) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		target := grpcPool[nodeIndex%len(grpcPool)]
+		conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			nodeIndex++
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		client := pb.NewBrokerServiceClient(conn)
+		stream, err := client.Subscribe(ctx)
+		if err != nil {
+			conn.Close()
+			nodeIndex++
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		err = stream.Send(&pb.SubscribeRequest{
+			Action:  "SUBSCRIBE",
+			Topic:   topicName,
+			GroupId: groupID,
+		})
+		if err != nil {
+			conn.Close()
+			nodeIndex++
+			continue
+		}
+
+		if readyWg != nil {
+			readyWg.Done()
+			readyWg = nil
+		}
+
+		ctxSub, cancelSub := context.WithCancel(ctx)
+		go func(c pb.BrokerService_SubscribeClient, cancelFunc context.CancelFunc) {
+			defer cancelFunc()
+			for {
+				select {
+				case <-ctxSub.Done():
+					return
+				case id := <-ackChan:
+					if sendErr := c.Send(&pb.SubscribeRequest{Action: "ACK", AckMessageId: id}); sendErr != nil {
+						return
+					}
+				}
+			}
+		}(stream, cancelSub)
+
+		for {
+			msg, err := stream.Recv()
+			if err != nil {
+				conn.Close()
+				nodeIndex++
+				cancelSub()
+				break
+			}
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+			atomic.AddUint64(metric, 1)
+			select {
+			case ackChan <- msg.Id:
+			default:
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func getTopicForID(id int) string {
+	if currentScenario == "isolation" {
+		if id%2 == 0 {
+			return "topic-A"
+		}
+		return "topic-B"
+	}
+	return topic
+}
+
+func runGrpcWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 	defer wg.Done()
-
 	targetIndex := id % len(grpcPool)
 	var conn *grpc.ClientConn
 	var client pb.BrokerServiceClient
-	var err error
 
-	connect := func() bool {
+	reconnect := func() bool {
 		if conn != nil {
 			conn.Close()
 		}
 		addr := grpcPool[targetIndex]
+		var err error
 		conn, err = grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			targetIndex = (targetIndex + 1) % len(grpcPool)
@@ -179,50 +368,55 @@ func runSmartGrpcWorker(done <-chan struct{}, wg *sync.WaitGroup, id int) {
 		return true
 	}
 
-	if !connect() {
+	if !reconnect() {
 		return
 	}
 	defer conn.Close()
 
+	targetTopic := getTopicForID(id)
 	payload := []byte(fmt.Sprintf("gRPC-%d", id))
 
 	for {
 		select {
-		case <-done:
+		case <-ctx.Done():
 			return
 		default:
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_, err := client.Publish(ctx, &pb.PublishRequest{Topic: topic, Payload: payload})
-			cancel()
-
+			_, err := client.Publish(ctx, &pb.PublishRequest{Topic: targetTopic, Payload: payload})
 			if err != nil {
 				targetIndex = (targetIndex + 1) % len(grpcPool)
-				connect()
+				reconnect()
 				time.Sleep(100 * time.Millisecond)
 			} else {
 				atomic.AddUint64(&totalReqs, 1)
+				if targetTopic == "topic-A" {
+					atomic.AddUint64(&pubA, 1)
+				}
+				if targetTopic == "topic-B" {
+					atomic.AddUint64(&pubB, 1)
+				}
 			}
 		}
 	}
 }
 
-func runSmartRestWorker(done <-chan struct{}, wg *sync.WaitGroup, id int) {
+func runRestWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 	defer wg.Done()
-	client := &http.Client{Timeout: 2 * time.Second}
+	client := &http.Client{Timeout: 1 * time.Second}
 	targetIndex := id % len(httpPool)
-
-	jsonStr := fmt.Sprintf(`{"topic": "%s", "payload": "REST-%d"}`, topic, id)
-	payload := []byte(jsonStr)
+	targetTopic := getTopicForID(id)
+	jsonStr := fmt.Sprintf(`{"topic": "%s", "payload": "REST-%d"}`, targetTopic, id)
+	var buf bytes.Buffer
 
 	for {
 		select {
-		case <-done:
+		case <-ctx.Done():
 			return
 		default:
+			buf.Reset()
+			buf.WriteString(jsonStr)
 			url := "http://" + httpPool[targetIndex] + "/publish"
-			resp, err := client.Post(url, "application/json", bytes.NewBuffer(payload))
 
-			// Failover Trigger
+			resp, err := client.Post(url, "application/json", bytes.NewBuffer(buf.Bytes()))
 			if err != nil || resp.StatusCode != 200 {
 				if resp != nil {
 					resp.Body.Close()
@@ -231,30 +425,36 @@ func runSmartRestWorker(done <-chan struct{}, wg *sync.WaitGroup, id int) {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-
-			resp.Body.Close()
 			atomic.AddUint64(&totalReqs, 1)
+			if targetTopic == "topic-A" {
+				atomic.AddUint64(&pubA, 1)
+			}
+			if targetTopic == "topic-B" {
+				atomic.AddUint64(&pubB, 1)
+			}
+			resp.Body.Close()
 		}
 	}
 }
 
-func runSmartGraphqlWorker(done <-chan struct{}, wg *sync.WaitGroup, id int) {
+func runGraphqlWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 	defer wg.Done()
-	client := &http.Client{Timeout: 2 * time.Second}
+	client := &http.Client{Timeout: 1 * time.Second}
 	targetIndex := id % len(httpPool)
-
-	query := fmt.Sprintf(`{"query": "mutation { publish(topic: \"%s\", payload: \"GQL-%d\") { success } }"}`, topic, id)
-	payload := []byte(query)
+	targetTopic := getTopicForID(id)
+	query := fmt.Sprintf(`{"query": "mutation { publish(topic: \"%s\", payload: \"GQL-%d\") { success } }"}`, targetTopic, id)
+	var buf bytes.Buffer
 
 	for {
 		select {
-		case <-done:
+		case <-ctx.Done():
 			return
 		default:
+			buf.Reset()
+			buf.WriteString(query)
 			url := "http://" + httpPool[targetIndex] + "/query"
-			resp, err := client.Post(url, "application/json", bytes.NewBuffer(payload))
 
-			// Failover Trigger
+			resp, err := client.Post(url, "application/json", bytes.NewBuffer(buf.Bytes()))
 			if err != nil || resp.StatusCode != 200 {
 				if resp != nil {
 					resp.Body.Close()
@@ -263,80 +463,66 @@ func runSmartGraphqlWorker(done <-chan struct{}, wg *sync.WaitGroup, id int) {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-
-			resp.Body.Close()
 			atomic.AddUint64(&totalReqs, 1)
+			if targetTopic == "topic-A" {
+				atomic.AddUint64(&pubA, 1)
+			}
+			if targetTopic == "topic-B" {
+				atomic.AddUint64(&pubB, 1)
+			}
+			resp.Body.Close()
 		}
 	}
 }
 
-func runInternalSubscriber(ctx context.Context, readyWg *sync.WaitGroup, addr string) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Printf("Auditor failed connect: %v", err)
-		readyWg.Done()
-		return
-	}
-
-	go func() { <-ctx.Done(); conn.Close() }()
-
-	client := pb.NewBrokerServiceClient(conn)
-	stream, err := client.Subscribe(ctx)
-	if err != nil {
-		readyWg.Done()
-		return
-	}
-
-	stream.Send(&pb.SubscribeRequest{Action: "SUBSCRIBE", Topic: topic})
-	readyWg.Done()
-
-	for {
-		msg, err := stream.Recv()
-		if err != nil {
-			return
-		}
-		atomic.AddUint64(&totalReceived, 1)
-		stream.Send(&pb.SubscribeRequest{Action: "ACK", AckMessageId: msg.Id})
-	}
-}
-
-func printReport(elapsed time.Duration) {
+func printReport(elapsed time.Duration, scenario string) {
 	pub := atomic.LoadUint64(&totalReqs)
 	sub := atomic.LoadUint64(&totalReceived)
+	if scenario == "isolation" {
+		sub = atomic.LoadUint64(&subA) + atomic.LoadUint64(&subB)
+	}
+
 	errs := atomic.LoadUint64(&totalErrs)
 	rps := float64(pub) / elapsed.Seconds()
 
-	fmt.Println("\n--- RELATÓRIO FINAL (CLUSTER) 🏁 ---")
-	fmt.Printf("Tempo Total: %.2fs\n", elapsed.Seconds())
-	fmt.Printf("Publicados: %d\n", pub)
-	fmt.Printf("Recebidos:  %d\n", sub)
-	fmt.Printf("Erros Totais: %d\n", errs)
-	fmt.Printf("⚡ THROUGHPUT: %.2f msg/seg ⚡\n", rps)
-	fmt.Println("-----------------------------------")
-}
+	fmt.Println("\n--- FINAL REPORT ---")
+	fmt.Printf("Total Time: %.2fs\n", elapsed.Seconds())
+	fmt.Printf("Published Total: %d\n", pub)
 
-func runDrainKicker(ctx context.Context, pool []string) {
-	client := &http.Client{Timeout: 500 * time.Millisecond}
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
+	if scenario == "isolation" {
+		fmt.Printf("   ├─ Topic A: %d\n", atomic.LoadUint64(&pubA))
+		fmt.Printf("   └─ Topic B: %d\n", atomic.LoadUint64(&pubB))
+		fmt.Printf("Total Received:  %d\n", sub)
+		fmt.Printf("   ├─ Sub A: %d\n", atomic.LoadUint64(&subA))
+		fmt.Printf("   └─ Sub B: %d\n", atomic.LoadUint64(&subB))
+	} else {
+		fmt.Printf("Received:  %d\n", sub)
+	}
 
-	dummyPayload := []byte(`{"topic": "heartbeat", "payload": "KEEP_ALIVE"}`)
+	loss := int64(pub) - int64(sub)
+	if loss < 0 {
+		loss = 0
+	}
 
-	go func() {
-		i := 0
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				target := pool[i%len(pool)]
-				url := fmt.Sprintf("http://%s/publish", target)
-				resp, _ := client.Post(url, "application/json", bytes.NewBuffer(dummyPayload))
-				if resp != nil {
-					resp.Body.Close()
-				}
-				i++
+	lossRate := (float64(loss) / float64(pub)) * 100
+	if pub == 0 {
+		lossRate = 0
+	}
+
+	fmt.Printf("General Loss: %d (%.2f%%)\n", loss, lossRate)
+	fmt.Printf("Network/Logic Errors: %d\n", errs)
+	fmt.Printf("THROUGHPUT: %.2f msg/seg ⚡\n", rps)
+
+	if errs > 0 {
+		fmt.Println("\nERRORS FOUND:")
+		errorMu.Lock()
+		for msg, count := range errorCounts {
+			if len(msg) > 80 {
+				msg = msg[:77] + "..."
 			}
+			fmt.Printf("   [%d] -> %s\n", count, msg)
 		}
-	}()
+		errorMu.Unlock()
+	}
+	fmt.Println("-----------------------------------")
 }

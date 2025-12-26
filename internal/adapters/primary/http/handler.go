@@ -2,6 +2,7 @@ package http
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/pedromedina19/hermes-broker/internal/core/services"
@@ -67,4 +68,61 @@ func (h *RestHandler) HandleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func (h *RestHandler) HandleSubscribeSSE(w http.ResponseWriter, r *http.Request) {
+	topic := r.URL.Query().Get("topic")
+	groupID := r.URL.Query().Get("group")
+
+	if topic == "" {
+		http.Error(w, "Topic query parameter is required", http.StatusBadRequest)
+		return
+	}
+
+	// Configure Headers for SSE
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// created signature in the engine
+	msgChan, subID, err := h.service.Subscribe(r.Context(), topic, groupID)
+	if err != nil {
+		http.Error(w, "Failed to subscribe: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer h.service.RemoveSubscriber(topic, subID)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Fprintf(w, "event: connected\ndata: {\"sub_id\": \"%s\"}\n\n", subID)
+	flusher.Flush()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case msg, ok := <-msgChan:
+			if !ok {
+				return
+			}
+
+			data, _ := json.Marshal(map[string]interface{}{
+				"id":        msg.ID,
+				"topic":     msg.Topic,
+				"payload":   string(msg.Payload),
+				"timestamp": msg.Timestamp.Unix(),
+			})
+
+			// SSE format: "data: <content>\n\n"
+			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			flusher.Flush()
+
+			h.service.Acknowledge(subID, msg.ID)
+		}
+	}
 }

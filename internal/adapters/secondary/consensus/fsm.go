@@ -11,7 +11,7 @@ import (
 	"github.com/pedromedina19/hermes-broker/internal/core/ports"
 )
 
-//BrokerFSM is the bridge between Raft and your Memory Engine
+// BrokerFSM is the bridge between Raft and your Memory Engine
 type BrokerFSM struct {
 	engine ports.BrokerEngine
 	logger *slog.Logger
@@ -32,9 +32,7 @@ func (fsm *BrokerFSM) Apply(l *raft.Log) interface{} {
 		return nil
 	}
 
-	fsm.logger.Info("⚡ FSM APPLIED (Raft Replicated)", "node_apply", "TRUE", "topic", msg.Topic, "msg_id", msg.ID)
-
-	// The context is background because this runs internally in the Raft loop
+	// Atenção: O engine.Publish já lida com I/O de disco e memória
 	if err := fsm.engine.Publish(context.TODO(), msg); err != nil {
 		fsm.logger.Error("FSM: Failed to publish to engine", "error", err)
 		return err
@@ -43,17 +41,19 @@ func (fsm *BrokerFSM) Apply(l *raft.Log) interface{} {
 	return nil
 }
 
-// Snapshots are used to compress the log.
-
 func (fsm *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	return &NoOpSnapshot{}, nil
 }
 
-// Restore recovers the state of a snapshot.
 func (fsm *BrokerFSM) Restore(rc io.ReadCloser) error {
+	// In a real-world scenario, we would read the binary from the database and replace the local file
+	// This requires closing the current database, replacing the file, and reopening it
+	// It's a complex "Hot Swap" operation
+	// For the benchmark, just drain the Reader to avoid crashing Raft
+	defer rc.Close()
+	io.Copy(io.Discard, rc)
 	return nil
 }
-
 
 type NoOpSnapshot struct{}
 

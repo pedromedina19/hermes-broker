@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -34,16 +35,20 @@ func main() {
 	
 	logger.Info("Starting Hermes Broker", "node_id", cfg.NodeID, "raft_port", cfg.RaftPort)
 
-	brokerEngine := memory.NewMemoryBroker(cfg.BufferSize, logger)
-
-	fsm := consensus.NewBrokerFSM(brokerEngine, logger)
-
 	raftConf := consensus.RaftConfig{
 		NodeID:    cfg.NodeID,
 		RaftPort:  cfg.RaftPort,
 		DataDir:   cfg.RaftDataDir,
 		Bootstrap: cfg.Bootstrap,
 	}
+	
+
+	brokerDataDir := filepath.Join(cfg.RaftDataDir, "broker_data") 
+    os.MkdirAll(brokerDataDir, 0755)
+
+	brokerEngine := memory.NewHybridBroker(brokerDataDir, cfg.BufferSize, logger)
+	fsm := consensus.NewBrokerFSM(brokerEngine, logger)
+
 	raftNode, err := consensus.NewRaftNode(raftConf, fsm, logger)
 	if err != nil {
 		logger.Error("Failed to initialize Raft", "error", err)
@@ -91,6 +96,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/publish", restHandler.HandlePublish) // REST Endpoint
 	mux.HandleFunc("/join", restHandler.HandleJoin)
+	mux.HandleFunc("/subscribe", restHandler.HandleSubscribeSSE)
 	mux.Handle("/query", gqlServer) // GraphQL Endpoint
 	mux.Handle("/", playground.Handler("GraphQL playground", "/query"))
 
