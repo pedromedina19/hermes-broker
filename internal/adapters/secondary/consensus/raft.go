@@ -12,7 +12,6 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
-	"github.com/pedromedina19/hermes-broker/internal/core/domain"
 )
 
 const (
@@ -96,17 +95,17 @@ func NewRaftNode(conf RaftConfig, fsm *BrokerFSM, logger *slog.Logger) (*RaftNod
 	}, nil
 }
 
-func (rn *RaftNode) ApplyMessage(msg domain.Message) error {
+func (rn *RaftNode) ApplyMessage(data interface{}) error {
 	if rn.Raft.State() != raft.Leader {
 		return fmt.Errorf("not the leader")
 	}
 
-	data, err := json.Marshal(msg)
+	buf, err := json.Marshal(data)
 	if err != nil {
 		return err
 	}
 
-	future := rn.Raft.Apply(data, RaftTimeout)
+	future := rn.Raft.Apply(buf, RaftTimeout)
 	if err := future.Error(); err != nil {
 		return err
 	}

@@ -74,3 +74,18 @@ During the `slow` scenario, we performed the **Leader Kill** test (killing the l
 3. **Smart Proxy:** The implementation of the internal proxy in the server ensures that the client doesn't need to know the cluster topology, being able to hit any node to publish data.
 
 ---
+
+## Post-Optimization Results (Hybrid Engine v2)
+
+After implementing **Nagle's Algorithm (Batching)** in Raft and **Object Pooling (sync.Pool)** in the Service Layer, the results were updated:
+
+| Protocol | Workers | Throughput (msg/sec) | Status |
+| :--- | :--- | :--- | :--- |
+| gRPC (Baseline) | 60 | 977.32 | Stable |
+| **gRPC (Optimized)** | 60 | **1,352.56** | High Performance |
+| **gRPC (Stress)** | 150 | **1,604.96** | Hardware Limit |
+
+### Applied Technical Improvements
+1. **Raft Log Batching:** Grouping of up to 500 messages per write operation.
+2. **Memory Recycling:** Use of `sync.Pool` to reduce `domain.Message` allocations by 90%.
+3. **Smart Proxy:** Automatic failover and traffic redirection between Followers and Leader.

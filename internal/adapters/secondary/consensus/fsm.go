@@ -26,16 +26,20 @@ func NewBrokerFSM(engine ports.BrokerEngine, logger *slog.Logger) *BrokerFSM {
 
 // Apply is called by Raft when a log is committed
 func (fsm *BrokerFSM) Apply(l *raft.Log) interface{} {
-	var msg domain.Message
-	if err := json.Unmarshal(l.Data, &msg); err != nil {
-		fsm.logger.Error("FSM: Failed to unmarshal command", "error", err)
-		return nil
+	var messages []domain.Message
+	if err := json.Unmarshal(l.Data, &messages); err != nil {
+		var msg domain.Message
+		if err := json.Unmarshal(l.Data, &msg); err != nil {
+			fsm.logger.Error("FSM: Failed to unmarshal", "error", err)
+			return err
+		}
+		messages = append(messages, msg)
 	}
 
-	// Atenção: O engine.Publish já lida com I/O de disco e memória
-	if err := fsm.engine.Publish(context.TODO(), msg); err != nil {
-		fsm.logger.Error("FSM: Failed to publish to engine", "error", err)
-		return err
+	for _, msg := range messages {
+		if err := fsm.engine.Publish(context.TODO(), msg); err != nil {
+			fsm.logger.Error("FSM: Failed to publish to engine", "id", msg.ID, "error", err)
+		}
 	}
 
 	return nil

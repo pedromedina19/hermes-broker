@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pedromedina19/hermes-broker/internal/core/domain"
@@ -14,47 +15,137 @@ import (
 )
 
 type ConsensusNode interface {
-	ApplyMessage(msg domain.Message) error
+	ApplyMessage(msg interface{}) error
 	Join(nodeID, raftAddr string) error
 	GetLeaderAddr() string
 	IsLeader() bool
 }
+type publishResult struct {
+	err error
+}
 type BrokerService struct {
-	engine ports.BrokerEngine
+	engine    ports.BrokerEngine
 	consensus ConsensusNode
+
+	batchChan chan *domain.Message
+	pending   map[string]chan publishResult
+	mu        sync.RWMutex
+
+	// Message Pool to reduce pressure on the GC
+	messagePool sync.Pool
 }
 
 func NewBrokerService(engine ports.BrokerEngine, consensus ConsensusNode) *BrokerService {
-	return &BrokerService{
+	s := &BrokerService{
 		engine:    engine,
 		consensus: consensus,
+		batchChan: make(chan *domain.Message, 20000),
+		pending:   make(map[string]chan publishResult),
+		messagePool: sync.Pool{
+			New: func() interface{} {
+				return &domain.Message{
+					Payload: make([]byte, 0, 1024), // Pre-allocates 1KB per message
+				}
+			},
+		},
 	}
+
+	go s.runBatcher()
+
+	return s
 }
 
 func (s *BrokerService) Publish(ctx context.Context, topic string, payload []byte) error {
-	msg := domain.Message{
-		Topic:     topic,
-		Payload:   payload,
-		Timestamp: time.Now(),
-	}
-
-	err := s.consensus.ApplyMessage(msg)
-	if err != nil && strings.Contains(err.Error(), "not the leader") {
-		// Server Proxy Logic
+	// If not a leader, immediate proxy (before allocating from the pool)
+	if !s.consensus.IsLeader() {
 		leaderID := s.consensus.GetLeaderAddr()
 		if leaderID == "" {
-			return fmt.Errorf("cluster in election, no leader found")
+			return fmt.Errorf("cluster in election")
 		}
-
-		// Simple mapping: node-1 -> hermes-1:50051
-		// In a real-world system, this would come from a Service Discovery process
 		leaderHost := strings.Replace(leaderID, "node-", "hermes-", 1)
-		leaderGrpcAddr := leaderHost + ":50051"
-
-		return s.proxyPublishToLeader(ctx, leaderGrpcAddr, topic, payload)
+		return s.proxyPublishToLeader(ctx, leaderHost+":50051", topic, payload)
 	}
 
-	return err
+	// Get a "clean" message from the Pool
+	msg := s.messagePool.Get().(*domain.Message)
+	msg.Reset()
+	msg.ID = fmt.Sprintf("%d", time.Now().UnixNano())
+	msg.Topic = topic
+	msg.Payload = append(msg.Payload, payload...)
+	msg.Timestamp = time.Now()
+
+	resChan := make(chan publishResult, 1)
+
+	s.mu.Lock()
+	s.pending[msg.ID] = resChan
+	s.mu.Unlock()
+
+	select {
+	case s.batchChan <- msg:
+	case <-ctx.Done():
+		s.mu.Lock()
+		delete(s.pending, msg.ID)
+		s.mu.Unlock()
+		s.messagePool.Put(msg)
+		return ctx.Err()
+	}
+
+	select {
+	case res := <-resChan:
+		s.messagePool.Put(msg)
+		return res.err
+	case <-ctx.Done():
+		s.mu.Lock()
+		delete(s.pending, msg.ID)
+		s.mu.Unlock()
+		s.messagePool.Put(msg)
+		return ctx.Err()
+	}
+}
+
+func (s *BrokerService) runBatcher() {
+	const maxBatchSize = 500
+	const lingerTime = 5 * time.Millisecond
+
+	for {
+		batch := make([]*domain.Message, 0, maxBatchSize)
+
+		msg, ok := <-s.batchChan
+		if !ok {
+			return
+		}
+		batch = append(batch, msg)
+
+		timeout := time.After(lingerTime)
+		full := false
+
+		for !full && len(batch) < maxBatchSize {
+			select {
+			case m := <-s.batchChan:
+				batch = append(batch, m)
+			case <-timeout:
+				full = true
+			}
+		}
+
+		// Convert pointers to values ​​only at Consensus time
+		// to prevent the pool from clearing the data before Raft finishes
+		raftPayload := make([]domain.Message, len(batch))
+		for i, m := range batch {
+			raftPayload[i] = *m
+		}
+
+		err := s.consensus.ApplyMessage(raftPayload)
+
+		s.mu.Lock()
+		for _, m := range batch {
+			if ch, ok := s.pending[m.ID]; ok {
+				ch <- publishResult{err: err}
+				delete(s.pending, m.ID)
+			}
+		}
+		s.mu.Unlock()
+	}
 }
 
 // proxyPublishToLeader forwards the request to the correct node
