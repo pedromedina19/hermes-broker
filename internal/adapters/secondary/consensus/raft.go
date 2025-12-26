@@ -33,6 +33,8 @@ type RaftConfig struct {
 
 func NewRaftNode(conf RaftConfig, fsm *BrokerFSM, logger *slog.Logger) (*RaftNode, error) {
 	config := raft.DefaultConfig()
+	config.LocalID = raft.ServerID(conf.NodeID)
+
 	raftLogger := hclog.New(&hclog.LoggerOptions{
 		Name:   "raft",
 		Level:  hclog.Info,
@@ -48,11 +50,11 @@ func NewRaftNode(conf RaftConfig, fsm *BrokerFSM, logger *slog.Logger) (*RaftNod
 	config.TrailingLogs = 1024
 
 
-	addr, err := net.ResolveTCPAddr("tcp", conf.RaftPort)
+	advertiseAddr, err := net.ResolveTCPAddr("tcp", conf.RaftPort)
 	if err != nil {
 		return nil, err
 	}
-	transport, err := raft.NewTCPTransport(conf.RaftPort, addr, 3, 10*time.Second, os.Stderr)
+	transport, err := raft.NewTCPTransport(conf.RaftPort, advertiseAddr, 3, 10*time.Second, os.Stderr)
 	if err != nil {
 		return nil, err
 	}

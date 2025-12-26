@@ -59,11 +59,15 @@ func (s *BrokerService) Publish(ctx context.Context, topic string, payload []byt
 	// If not a leader, immediate proxy (before allocating from the pool)
 	if !s.consensus.IsLeader() {
 		leaderID := s.consensus.GetLeaderAddr()
+		
 		if leaderID == "" {
-			return fmt.Errorf("cluster in election")
+			return fmt.Errorf("cluster in election: no leader found at the moment")
 		}
+
 		leaderHost := strings.Replace(leaderID, "node-", "hermes-", 1)
-		return s.proxyPublishToLeader(ctx, leaderHost+":50051", topic, payload)
+		leaderTarget := leaderHost + ":50051"
+		
+		return s.proxyPublishToLeader(ctx, leaderTarget, topic, payload)
 	}
 
 	// Get a "clean" message from the Pool

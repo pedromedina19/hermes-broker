@@ -1,45 +1,52 @@
 services:
   hermes-1:
     build: .
+    image: hermes-broker:latest
     hostname: hermes-1
     container_name: hermes-1
     ports:
-      - "50051:50051" # gRPC Host
-      - "8080:8080"   # HTTP Host
+      - "50051:50051"
+      - "8080:8080"
     environment:
       - HERMES_NODE_ID=node-1
       - HERMES_BUFFER_SIZE=20000
-      - HERMES_RAFT_PORT=hermes-1:6000
+      - HERMES_RAFT_PORT=172.20.0.10:6000
       - HERMES_GRPC_PORT=:50051
       - HERMES_HTTP_PORT=:8080
-      - HERMES_BOOTSTRAP=true  # <--- O LÍDER SUPREMO NASCE AQUI
+      - HERMES_BOOTSTRAP=true
     volumes:
-      - ./data/node-1:/root/data # Persistência
+      - ./data/node-1:/root/data
     networks:
-      - hermes-net
+      hermes-net:
+        ipv4_address: 172.20.0.10
 
   hermes-2:
-    build: .
+    image: hermes-broker:latest
+    depends_on:
+      - hermes-1
     hostname: hermes-2
     container_name: hermes-2
     ports:
-      - "50052:50051" # Mapeia 50052 do host para 50051 do container
+      - "50052:50051"
       - "8081:8080"
     environment:
       - HERMES_NODE_ID=node-2
       - HERMES_BUFFER_SIZE=20000
-      - HERMES_RAFT_PORT=hermes-2:6000
+      - HERMES_RAFT_PORT=172.20.0.11:6000
       - HERMES_GRPC_PORT=:50051
       - HERMES_HTTP_PORT=:8080
-      - HERMES_BOOTSTRAP=false # <--- Seguidor, espera convite
-      - HERMES_JOIN_ADDR=hermes-1:8080
+      - HERMES_BOOTSTRAP=false
+      - HERMES_JOIN_ADDR=172.20.0.10:8080
     volumes:
       - ./data/node-2:/root/data
     networks:
-      - hermes-net
+      hermes-net:
+        ipv4_address: 172.20.0.11
 
   hermes-3:
-    build: .
+    image: hermes-broker:latest
+    depends_on:
+      - hermes-1
     hostname: hermes-3
     container_name: hermes-3
     ports:
@@ -48,16 +55,20 @@ services:
     environment:
       - HERMES_NODE_ID=node-3
       - HERMES_BUFFER_SIZE=20000
-      - HERMES_RAFT_PORT=hermes-3:6000
+      - HERMES_RAFT_PORT=172.20.0.12:6000
       - HERMES_GRPC_PORT=:50051
       - HERMES_HTTP_PORT=:8080
       - HERMES_BOOTSTRAP=false
-      - HERMES_JOIN_ADDR=hermes-1:8080
+      - HERMES_JOIN_ADDR=172.20.0.10:8080
     volumes:
       - ./data/node-3:/root/data
     networks:
-      - hermes-net
+      hermes-net:
+        ipv4_address: 172.20.0.12
 
 networks:
   hermes-net:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
