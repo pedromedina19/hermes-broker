@@ -32,7 +32,7 @@ import (
 func main() {
 	cfg := config.Load()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	
+
 	logger.Info("Starting Hermes Broker", "node_id", cfg.NodeID, "raft_port", cfg.RaftPort)
 
 	raftConf := consensus.RaftConfig{
@@ -41,10 +41,9 @@ func main() {
 		DataDir:   cfg.RaftDataDir,
 		Bootstrap: cfg.Bootstrap,
 	}
-	
 
-	brokerDataDir := filepath.Join(cfg.RaftDataDir, "broker_data") 
-    os.MkdirAll(brokerDataDir, 0755)
+	brokerDataDir := filepath.Join(cfg.RaftDataDir, "broker_data")
+	os.MkdirAll(brokerDataDir, 0755)
 
 	brokerEngine := memory.NewHybridBroker(brokerDataDir, cfg.BufferSize, logger)
 	fsm := consensus.NewBrokerFSM(brokerEngine, logger)
@@ -54,13 +53,17 @@ func main() {
 		logger.Error("Failed to initialize Raft", "error", err)
 		os.Exit(1)
 	}
-	
+
 	brokerService := services.NewBrokerService(brokerEngine, raftNode)
 
-	if cfg.JoinAddr != "" {
-        go autoJoin(cfg, logger)
-    }
-	
+	if cfg.JoinAddr != "" && !cfg.Bootstrap && !raftNode.HasState() {
+		go autoJoin(cfg, logger)
+	} else {
+		logger.Info("Skipping Automatic Join",
+			"is_bootstrap", cfg.Bootstrap,
+			"has_state", raftNode.HasState())
+	}
+
 	grpcListener, err := net.Listen("tcp", cfg.GRPCPort)
 	if err != nil {
 		logger.Error("Failed to listen gRPC", "error", err)
@@ -79,9 +82,9 @@ func main() {
 	}()
 
 	// server HTTP REST + GraphQL (8080)
-	
+
 	gqlServer := handler.NewDefaultServer(graph.NewExecutableSchema(graph.Config{Resolvers: &graph.Resolver{Service: brokerService}}))
-	
+
 	// subscription support
 	gqlServer.AddTransport(&transport.Websocket{
 		KeepAlivePingInterval: 10 * time.Second,
@@ -127,36 +130,36 @@ func main() {
 }
 
 func autoJoin(cfg config.Config, logger *slog.Logger) {
-    // Wait a moment to ensure that both the server and the leader are up
-    time.Sleep(2 * time.Second)
+	// Wait a moment to ensure that both the server and the leader are up
+	time.Sleep(2 * time.Second)
 
-    target := "http://" + cfg.JoinAddr + "/join"
-    
-    reqBody := map[string]string{
-        "node_id":   cfg.NodeID,
-        "raft_addr": cfg.RaftPort,
-    }
-    
-    body, _ := json.Marshal(reqBody)
+	target := "http://" + cfg.JoinAddr + "/join"
 
-    // Try for 1 minute (Retry with Backoff)
-    for i := 0; i < 10; i++ {
-        logger.Info("Attempting to join cluster...", "target", target)
-        
-        resp, err := http.Post(target, "application/json", bytes.NewBuffer(body))
-        if err == nil && resp.StatusCode == 200 {
-            logger.Info("Successfully joined the cluster!")
-            return
-        }
+	reqBody := map[string]string{
+		"node_id":   cfg.NodeID,
+		"raft_addr": cfg.RaftPort,
+	}
 
-        if err != nil {
-            logger.Warn("Failed to join cluster (retrying...)", "error", err)
-        } else {
-            logger.Warn("Failed to join cluster (retrying...)", "status", resp.StatusCode)
-        }
+	body, _ := json.Marshal(reqBody)
 
-        time.Sleep(5 * time.Second)
-    }
-    
-    logger.Error("Could not join cluster after multiple attempts. Running in isolation.")
+	// Try for 1 minute (Retry with Backoff)
+	for i := 0; i < 10; i++ {
+		logger.Info("Attempting to join cluster...", "target", target)
+
+		resp, err := http.Post(target, "application/json", bytes.NewBuffer(body))
+		if err == nil && resp.StatusCode == 200 {
+			logger.Info("Successfully joined the cluster!")
+			return
+		}
+
+		if err != nil {
+			logger.Warn("Failed to join cluster (retrying...)", "error", err)
+		} else {
+			logger.Warn("Failed to join cluster (retrying...)", "status", resp.StatusCode)
+		}
+
+		time.Sleep(5 * time.Second)
+	}
+
+	logger.Error("Could not join cluster after multiple attempts. Running in isolation.")
 }

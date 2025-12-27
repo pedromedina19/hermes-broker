@@ -22,6 +22,7 @@ type RaftNode struct {
 	Raft   *raft.Raft
 	logger *slog.Logger
 	config RaftConfig
+	hasState bool
 }
 
 type RaftConfig struct {
@@ -46,18 +47,28 @@ func NewRaftNode(conf RaftConfig, fsm *BrokerFSM, logger *slog.Logger) (*RaftNod
 	config.ElectionTimeout = 500 * time.Millisecond
 	config.CommitTimeout = 50 * time.Millisecond
 	config.SnapshotThreshold = 1024
-    config.SnapshotInterval = 120 * time.Second
+	config.SnapshotInterval = 120 * time.Second
 	config.TrailingLogs = 1024
 
+	var advertiseAddr *net.TCPAddr
+    var err error
+    for i := 0; i < 10; i++ {
+        advertiseAddr, err = net.ResolveTCPAddr("tcp", conf.RaftPort)
+        if err == nil {
+            break
+        }
+        logger.Warn("Waiting for DNS to become available...", "host", conf.RaftPort, "attempt", i+1)
+        time.Sleep(2 * time.Second)
+    }
+    
+    if err != nil {
+        return nil, fmt.Errorf("failed to resolve advertise address after retries: %w", err)
+    }
 
-	advertiseAddr, err := net.ResolveTCPAddr("tcp", conf.RaftPort)
-	if err != nil {
-		return nil, err
-	}
-	transport, err := raft.NewTCPTransport(conf.RaftPort, advertiseAddr, 3, 10*time.Second, os.Stderr)
-	if err != nil {
-		return nil, err
-	}
+    transport, err := raft.NewTCPTransport(conf.RaftPort, advertiseAddr, 3, 10*time.Second, os.Stderr)
+    if err != nil {
+        return nil, err
+    }
 
 	os.MkdirAll(conf.DataDir, 0700)
 
@@ -72,12 +83,17 @@ func NewRaftNode(conf RaftConfig, fsm *BrokerFSM, logger *slog.Logger) (*RaftNod
 		return nil, fmt.Errorf("file snapshot store: %w", err)
 	}
 
+	hasState, err := raft.HasExistingState(logStore, logStore, snapshotStore)
+    if err != nil {
+        return nil, err
+    }
+
 	r, err := raft.NewRaft(config, fsm, logStore, logStore, snapshotStore, transport)
 	if err != nil {
 		return nil, fmt.Errorf("new raft: %w", err)
 	}
 
-	if conf.Bootstrap {
+	if conf.Bootstrap && !hasState {
 		logger.Info("Bootstrapping new cluster", "node", conf.NodeID)
 		configuration := raft.Configuration{
 			Servers: []raft.Server{
@@ -94,6 +110,7 @@ func NewRaftNode(conf RaftConfig, fsm *BrokerFSM, logger *slog.Logger) (*RaftNod
 		Raft:   r,
 		logger: logger,
 		config: conf,
+		hasState: hasState,
 	}, nil
 }
 
@@ -137,4 +154,8 @@ func (rn *RaftNode) GetLeaderAddr() string {
 
 func (rn *RaftNode) IsLeader() bool {
 	return rn.Raft.State() == raft.Leader
+}
+
+func (rn *RaftNode) HasState() bool {
+    return rn.hasState
 }

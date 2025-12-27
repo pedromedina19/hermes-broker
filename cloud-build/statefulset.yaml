@@ -1,0 +1,104 @@
+# Internal service for Raft (Headless) communication.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes-internal
+  labels:
+    app: hermes
+spec:
+  clusterIP: None
+  selector:
+    app: hermes
+  ports:
+    - name: raft
+      port: 6000
+---
+# Hermes Cluster Controller
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hermes
+spec:
+  serviceName: "hermes-internal"
+  replicas: 3
+  selector:
+    matchLabels:
+      app: hermes
+  template:
+    metadata:
+      labels:
+        app: hermes
+    spec:
+      # Anti-affinity to ensure that each Pod is located on a different physical node in GCP
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["hermes"]
+              topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: hermes
+          image: southamerica-east1-docker.pkg.dev/oval-bricolage-482523-t7/hermes-repo/hermes-broker:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export HOST_NAME=$(hostname)
+              echo "Iniciando nó: $HOST_NAME"
+              
+              # Defines whether it's Bootstrap based on the fixed name of the StatefulSet
+              if [ "$HOST_NAME" = "hermes-0" ]; then
+                echo "Mode: BOOTSTRAP (Initial Leader)"
+                export HERMES_BOOTSTRAP=true
+              else
+                echo "Mode: FOLLOWER (Waiting to Join)"
+                export HERMES_BOOTSTRAP=false
+              fi
+              
+              # Executes Hermes binary
+              ./hermes
+          env:
+            - name: HERMES_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP # Get the internal IP address of the Pod on the K8s
+            - name: HERMES_RAFT_PORT
+              value: "$(HERMES_NODE_ID).hermes-internal:6000"
+            - name: HERMES_JOIN_ADDR
+              # to Join, we use the fixed DNS of node 0
+              value: "hermes-0.hermes-internal:8080"
+            - name: HERMES_GRPC_PORT
+              value: ":50051"
+            - name: HERMES_HTTP_PORT
+              value: ":8080"
+            - name: HERMES_DATA_DIR
+              value: "/root/data"
+            - name: HERMES_BUFFER_SIZE
+              value: "20000"
+          ports:
+            - containerPort: 50051
+              name: grpc
+            - containerPort: 8080
+              name: http
+            - containerPort: 6000
+              name: raft
+          volumeMounts:
+            - name: hermes-storage
+              mountPath: /root/data
+  
+  # Automatic SSD provisioning in Google Cloud
+  volumeClaimTemplates:
+    - metadata:
+        name: hermes-storage
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        storageClassName: "standard"
+        resources:
+          requests:
+            storage: 10Gi

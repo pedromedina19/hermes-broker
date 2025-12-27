@@ -1,0 +1,33 @@
+substitutions:
+  _SERVICE: hermes-broker
+  _REGION: southamerica-east1
+  _ZONE: southamerica-east1-a
+  _CLUSTER: hermes-cluster
+  _REPO_NAME: hermes-repo
+
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args: [
+      "build", 
+      "-t", "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/${_SERVICE}:$BUILD_ID",
+      "-t", "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/${_SERVICE}:latest",
+      "."
+    ]
+
+  - name: "gcr.io/cloud-builders/docker"
+    args: ["push", "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/${_SERVICE}:$BUILD_ID"]
+  
+  - name: "gcr.io/cloud-builders/docker"
+    args: ["push", "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/${_SERVICE}:latest"]
+
+  - name: "gcr.io/cloud-builders/kubectl"
+    args:
+      [
+        "set",
+        "image",
+        "statefulset/hermes",
+        "hermes=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/${_SERVICE}:$BUILD_ID",
+      ]
+    env:
+      - "CLOUDSDK_COMPUTE_REGION=${_ZONE}"
+      - "CLOUDSDK_CONTAINER_CLUSTER=${_CLUSTER}"

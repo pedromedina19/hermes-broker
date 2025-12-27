@@ -1,0 +1,17 @@
+# internal-svc.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes-internal
+  labels:
+    app: hermes
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: hermes
+  ports:
+    - name: raft
+      port: 6000
+    - name: http
+      port: 8080
