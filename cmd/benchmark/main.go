@@ -21,6 +21,7 @@ import (
 var (
 	grpcTargetsStr string
 	httpTargetsStr string
+	subTarget      string
 
 	grpcPool []string
 	httpPool []string
@@ -77,6 +78,7 @@ func main() {
 
 	flag.StringVar(&grpcTargetsStr, "grpc-targets", "localhost:50051,localhost:50052,localhost:50053", "List of gRPC nodes (csv)")
 	flag.StringVar(&httpTargetsStr, "http-targets", "localhost:8080,localhost:8081,localhost:8082", "HTTP Node List (csv)")
+	flag.StringVar(&subTarget, "sub-target", "localhost:50051", "Specific gRPC node for the Subscriber (Auditor)")
 
 	flag.Parse()
 	currentScenario = *scenario
@@ -86,7 +88,8 @@ func main() {
 
 	fmt.Printf("STARTING TEST: %s \n", strings.ToUpper(*scenario))
 	fmt.Printf("Protocol: %s | Workers: %d | Duration: %v\n", strings.ToUpper(*protocol), *workers, *duration)
-	fmt.Printf("Cluster gRPC: %v\n\n", grpcPool)
+	fmt.Printf("Publisher Pool: %v\n", grpcPool)
+	fmt.Printf("Subscriber Target: %s\n\n", subTarget)
 
 	pubCtx, pubCancel := context.WithTimeout(context.Background(), *duration)
 	defer pubCancel()
@@ -259,7 +262,6 @@ drainLoop:
 
 func runInternalSubscriber(ctx context.Context, readyWg *sync.WaitGroup, topicName, groupID string, delay time.Duration, metric *uint64) {
 	ackChan := make(chan string, 200000)
-	nodeIndex := 0
 
 	for {
 		select {
@@ -268,10 +270,9 @@ func runInternalSubscriber(ctx context.Context, readyWg *sync.WaitGroup, topicNa
 		default:
 		}
 
-		target := grpcPool[nodeIndex%len(grpcPool)]
+		target := subTarget
 		conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
-			nodeIndex++
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
@@ -280,7 +281,6 @@ func runInternalSubscriber(ctx context.Context, readyWg *sync.WaitGroup, topicNa
 		stream, err := client.Subscribe(ctx)
 		if err != nil {
 			conn.Close()
-			nodeIndex++
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
@@ -292,7 +292,6 @@ func runInternalSubscriber(ctx context.Context, readyWg *sync.WaitGroup, topicNa
 		})
 		if err != nil {
 			conn.Close()
-			nodeIndex++
 			continue
 		}
 
@@ -320,7 +319,6 @@ func runInternalSubscriber(ctx context.Context, readyWg *sync.WaitGroup, topicNa
 			msg, err := stream.Recv()
 			if err != nil {
 				conn.Close()
-				nodeIndex++
 				cancelSub()
 				break
 			}
@@ -417,7 +415,7 @@ func runRestWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 			url := "http://" + httpPool[targetIndex] + "/publish"
 
 			resp, err := client.Post(url, "application/json", bytes.NewBuffer(buf.Bytes()))
-			if err != nil || resp.StatusCode != 200 {
+			if err != nil || (resp != nil && resp.StatusCode != 200) {
 				if resp != nil {
 					resp.Body.Close()
 				}
@@ -455,7 +453,7 @@ func runGraphqlWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 			url := "http://" + httpPool[targetIndex] + "/query"
 
 			resp, err := client.Post(url, "application/json", bytes.NewBuffer(buf.Bytes()))
-			if err != nil || resp.StatusCode != 200 {
+			if err != nil || (resp != nil && resp.StatusCode != 200) {
 				if resp != nil {
 					resp.Body.Close()
 				}

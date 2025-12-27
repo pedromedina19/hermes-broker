@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pedromedina19/hermes-broker/internal/core/domain"
+	"github.com/pedromedina19/hermes-broker/internal/core/metrics"
 	"github.com/pedromedina19/hermes-broker/internal/core/ports"
 	"github.com/pedromedina19/hermes-broker/pb"
 	"google.golang.org/grpc"
@@ -59,15 +61,19 @@ func (s *BrokerService) Publish(ctx context.Context, topic string, payload []byt
 	// If not a leader, immediate proxy (before allocating from the pool)
 	if !s.consensus.IsLeader() {
 		leaderID := s.consensus.GetLeaderAddr()
-		
+
 		if leaderID == "" {
 			return fmt.Errorf("cluster in election: no leader found at the moment")
 		}
 
 		leaderHost := strings.Replace(leaderID, "node-", "hermes-", 1)
 		leaderTarget := leaderHost + ":50051"
-		
-		return s.proxyPublishToLeader(ctx, leaderTarget, topic, payload)
+
+		err := s.proxyPublishToLeader(ctx, leaderTarget, topic, payload)
+		if err != nil {
+			atomic.AddUint64(&metrics.FailedCount, 1)
+		}
+		return err
 	}
 
 	// Get a "clean" message from the Pool
@@ -87,6 +93,7 @@ func (s *BrokerService) Publish(ctx context.Context, topic string, payload []byt
 	select {
 	case s.batchChan <- msg:
 	case <-ctx.Done():
+		atomic.AddUint64(&metrics.FailedCount, 1)
 		s.mu.Lock()
 		delete(s.pending, msg.ID)
 		s.mu.Unlock()
@@ -183,3 +190,6 @@ func (s *BrokerService) RemoveSubscriber(topic, subID string) {
 func (s *BrokerService) JoinCluster(nodeID, addr string) error {
 	return s.consensus.Join(nodeID, addr)
 }
+
+func (s *BrokerService) IsLeader() bool      { return s.consensus.IsLeader() }
+func (s *BrokerService) GetLeaderID() string { return s.consensus.GetLeaderAddr() }

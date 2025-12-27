@@ -93,11 +93,12 @@ func main() {
 		},
 	})
 
-	restHandler := http_adapter.NewRestHandler(brokerService)
+	restHandler := http_adapter.NewRestHandler(brokerService, cfg)
 
 	// Mux (default go router)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/publish", restHandler.HandlePublish) // REST Endpoint
+	mux.HandleFunc("/status", restHandler.HandleStatus)
 	mux.HandleFunc("/join", restHandler.HandleJoin)
 	mux.HandleFunc("/subscribe", restHandler.HandleSubscribeSSE)
 	mux.Handle("/query", gqlServer) // GraphQL Endpoint

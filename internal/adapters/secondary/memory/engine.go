@@ -6,11 +6,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/pedromedina19/hermes-broker/internal/adapters/secondary/storage"
 	"github.com/pedromedina19/hermes-broker/internal/core/domain"
+	"github.com/pedromedina19/hermes-broker/internal/core/metrics"
 	"github.com/pedromedina19/hermes-broker/internal/core/ports"
 )
 
@@ -168,7 +170,7 @@ func (b *HybridBroker) Subscribe(ctx context.Context, topic string, groupID stri
 	b.logger.Info("Subscriber connected", "id", subID, "start_offset", startOffset, "group", groupID)
 
 	go b.runSubscriberPump(sub, topic)
-
+	atomic.AddInt64(&metrics.ActiveSubscribers, 1)
 	return ch, subID, nil
 }
 
@@ -266,6 +268,7 @@ func (b *HybridBroker) trackPending(subID string, msg domain.Message) {
 		SentAt: time.Now(),
 	}
 	shard.mu.Unlock()
+	atomic.AddUint64(&metrics.ConsumedCount, 1)
 }
 
 func (b *HybridBroker) Acknowledge(subID, msgID string) {
@@ -384,6 +387,7 @@ func (b *HybridBroker) Unsubscribe(topic string, subID string) {
 	shard.mu.Unlock()
 
 	b.logger.Info("Subscriber removed gracefully", "topic", topic, "id", subID)
+	atomic.AddInt64(&metrics.ActiveSubscribers, -1)
 }
 
 func (b *HybridBroker) Close() {

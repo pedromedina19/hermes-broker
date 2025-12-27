@@ -5,18 +5,24 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/pedromedina19/hermes-broker/internal/adapters/secondary/config"
+	"github.com/pedromedina19/hermes-broker/internal/core/metrics"
 	"github.com/pedromedina19/hermes-broker/internal/core/services"
 )
 
 type RestHandler struct {
 	service *services.BrokerService
+	cfg     config.Config
 }
 type JoinRequest struct {
 	NodeID   string `json:"node_id"`
 	RaftAddr string `json:"raft_addr"`
 }
-func NewRestHandler(service *services.BrokerService) *RestHandler {
-	return &RestHandler{service: service}
+func NewRestHandler(service *services.BrokerService, cfg config.Config) *RestHandler {
+	return &RestHandler{
+		service: service,
+		cfg:     cfg,
+	}
 }
 
 type PublishRequest struct {
@@ -125,4 +131,18 @@ func (h *RestHandler) HandleSubscribeSSE(w http.ResponseWriter, r *http.Request)
 			h.service.Acknowledge(subID, msg.ID)
 		}
 	}
+}
+
+func (h *RestHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
+	snapshot := metrics.GetSnapshot()
+	
+	res := map[string]interface{}{
+		"node_id":    h.cfg.NodeID,
+		"is_leader":  h.service.IsLeader(),
+		"leader_id":  h.service.GetLeaderID(),
+		"stats":      snapshot,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
 }
