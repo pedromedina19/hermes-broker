@@ -42,6 +42,7 @@ var (
 	errorMu     sync.Mutex
 
 	currentScenario string
+	deliveryMode    pb.DeliveryMode
 )
 
 func recordError(err error) {
@@ -63,18 +64,12 @@ func recordError(err error) {
 	errorMu.Unlock()
 }
 
-func recordCustomError(msg string) {
-	atomic.AddUint64(&totalErrs, 1)
-	errorMu.Lock()
-	errorCounts[msg]++
-	errorMu.Unlock()
-}
-
 func main() {
 	workers := flag.Int("workers", 60, "Total number of simultaneous workers")
 	duration := flag.Duration("duration", 15*time.Second, "Test duration")
 	scenario := flag.String("scenario", "live", "Cenários: live, disk, slow, late, crash, isolation")
 	protocol := flag.String("protocol", "all", "Protocolo: grpc, rest, graphql, all")
+	modeFlag := flag.String("mode", "consistent", "Modo de entrega: consistent (Raft), performance (Direct Disk)")
 
 	flag.StringVar(&grpcTargetsStr, "grpc-targets", "localhost:50051,localhost:50052,localhost:50053", "List of gRPC nodes (csv)")
 	flag.StringVar(&httpTargetsStr, "http-targets", "localhost:8080,localhost:8081,localhost:8082", "HTTP Node List (csv)")
@@ -83,11 +78,17 @@ func main() {
 	flag.Parse()
 	currentScenario = *scenario
 
+	if strings.ToLower(*modeFlag) == "performance" {
+		deliveryMode = pb.DeliveryMode_PERFORMANCE
+	} else {
+		deliveryMode = pb.DeliveryMode_CONSISTENT
+	}
+
 	grpcPool = strings.Split(grpcTargetsStr, ",")
 	httpPool = strings.Split(httpTargetsStr, ",")
 
 	fmt.Printf("STARTING TEST: %s \n", strings.ToUpper(*scenario))
-	fmt.Printf("Protocol: %s | Workers: %d | Duration: %v\n", strings.ToUpper(*protocol), *workers, *duration)
+	fmt.Printf("Protocol: %s | Mode: %s | Workers: %d | Duration: %v\n", strings.ToUpper(*protocol), strings.ToUpper(*modeFlag), *workers, *duration)
 	fmt.Printf("Publisher Pool: %v\n", grpcPool)
 	fmt.Printf("Subscriber Target: %s\n\n", subTarget)
 
@@ -260,6 +261,7 @@ drainLoop:
 	printReport(elapsed, *scenario)
 }
 
+
 func runInternalSubscriber(ctx context.Context, readyWg *sync.WaitGroup, topicName, groupID string, delay time.Duration, metric *uint64) {
 	ackChan := make(chan string, 200000)
 
@@ -379,7 +381,11 @@ func runGrpcWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 		case <-ctx.Done():
 			return
 		default:
-			_, err := client.Publish(ctx, &pb.PublishRequest{Topic: targetTopic, Payload: payload})
+			_, err := client.Publish(ctx, &pb.PublishRequest{
+				Topic:   targetTopic,
+				Payload: payload,
+				Mode:    deliveryMode,
+			})
 			if err != nil {
 				targetIndex = (targetIndex + 1) % len(grpcPool)
 				reconnect()
@@ -402,7 +408,13 @@ func runRestWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 	client := &http.Client{Timeout: 1 * time.Second}
 	targetIndex := id % len(httpPool)
 	targetTopic := getTopicForID(id)
-	jsonStr := fmt.Sprintf(`{"topic": "%s", "payload": "REST-%d"}`, targetTopic, id)
+
+	modeVal := 0
+	if deliveryMode == pb.DeliveryMode_PERFORMANCE {
+		modeVal = 1
+	}
+
+	jsonStr := fmt.Sprintf(`{"topic": "%s", "payload": "REST-%d", "mode": %d}`, targetTopic, id, modeVal)
 	var buf bytes.Buffer
 
 	for {
@@ -440,7 +452,14 @@ func runGraphqlWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 	client := &http.Client{Timeout: 1 * time.Second}
 	targetIndex := id % len(httpPool)
 	targetTopic := getTopicForID(id)
-	query := fmt.Sprintf(`{"query": "mutation { publish(topic: \"%s\", payload: \"GQL-%d\") { success } }"}`, targetTopic, id)
+
+	query := ""
+	if deliveryMode == pb.DeliveryMode_PERFORMANCE {
+		query = fmt.Sprintf(`{"query": "mutation { publish(topic: \"%s\", payload: \"GQL-%d\", mode: PERFORMANCE) { success } }"}`, targetTopic, id)
+	} else {
+		query = fmt.Sprintf(`{"query": "mutation { publish(topic: \"%s\", payload: \"GQL-%d\") { success } }"}`, targetTopic, id)
+	}
+
 	var buf bytes.Buffer
 
 	for {

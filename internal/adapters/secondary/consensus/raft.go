@@ -19,9 +19,9 @@ const (
 )
 
 type RaftNode struct {
-	Raft   *raft.Raft
-	logger *slog.Logger
-	config RaftConfig
+	Raft     *raft.Raft
+	logger   *slog.Logger
+	config   RaftConfig
 	hasState bool
 }
 
@@ -43,50 +43,55 @@ func NewRaftNode(conf RaftConfig, fsm *BrokerFSM, logger *slog.Logger) (*RaftNod
 	})
 	config.Logger = raftLogger
 	config.LocalID = raft.ServerID(conf.NodeID)
-	config.HeartbeatTimeout = 500 * time.Millisecond
-	config.ElectionTimeout = 500 * time.Millisecond
-	config.CommitTimeout = 50 * time.Millisecond
-	config.SnapshotThreshold = 1024
-	config.SnapshotInterval = 120 * time.Second
-	config.TrailingLogs = 1024
+	config.HeartbeatTimeout = 2000 * time.Millisecond
+	config.ElectionTimeout = 2000 * time.Millisecond
+	config.CommitTimeout = 100 * time.Millisecond
+	config.SnapshotThreshold = 32768
+	config.SnapshotInterval = 60 * time.Second
+	config.TrailingLogs = 8192
 
-	var advertiseAddr *net.TCPAddr
-    var err error
-    for i := 0; i < 10; i++ {
-        advertiseAddr, err = net.ResolveTCPAddr("tcp", conf.RaftPort)
-        if err == nil {
-            break
-        }
-        logger.Warn("Waiting for DNS to become available...", "host", conf.RaftPort, "attempt", i+1)
-        time.Sleep(2 * time.Second)
-    }
-    
-    if err != nil {
-        return nil, fmt.Errorf("failed to resolve advertise address after retries: %w", err)
-    }
+	var addr *net.TCPAddr
+	var err error
+	maxRetries := 30
 
-    transport, err := raft.NewTCPTransport(conf.RaftPort, advertiseAddr, 3, 10*time.Second, os.Stderr)
-    if err != nil {
-        return nil, err
-    }
+	for i := 0; i < maxRetries; i++ {
+		addr, err = net.ResolveTCPAddr("tcp", conf.RaftPort)
+		if err == nil {
+			logger.Info("DNS Resolved successfully", "addr", addr.String())
+			break
+		}
+		logger.Warn("Waiting for DNS resolution...", "target", conf.RaftPort, "error", err, "attempt", i+1)
+		time.Sleep(2 * time.Second)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve raft address after retries: %w", err)
+	}
+
+	transport, err := raft.NewTCPTransport(conf.RaftPort, addr, 3, 10*time.Second, os.Stderr)
+	if err != nil {
+		return nil, err
+	}
 
 	os.MkdirAll(conf.DataDir, 0700)
 
+	// BoltDB (Log Store)
 	boltFile := filepath.Join(conf.DataDir, "raft.db")
 	logStore, err := raftboltdb.NewBoltStore(boltFile)
 	if err != nil {
 		return nil, fmt.Errorf("new bolt store: %w", err)
 	}
 
+	// Snapshot Store
 	snapshotStore, err := raft.NewFileSnapshotStore(conf.DataDir, 1, os.Stderr)
 	if err != nil {
 		return nil, fmt.Errorf("file snapshot store: %w", err)
 	}
 
 	hasState, err := raft.HasExistingState(logStore, logStore, snapshotStore)
-    if err != nil {
-        return nil, err
-    }
+	if err != nil {
+		return nil, err
+	}
 
 	r, err := raft.NewRaft(config, fsm, logStore, logStore, snapshotStore, transport)
 	if err != nil {
@@ -94,12 +99,12 @@ func NewRaftNode(conf RaftConfig, fsm *BrokerFSM, logger *slog.Logger) (*RaftNod
 	}
 
 	if conf.Bootstrap && !hasState {
-		logger.Info("Bootstrapping new cluster", "node", conf.NodeID)
+		logger.Info("Bootstrapping new cluster with DNS", "node", conf.NodeID, "addr", conf.RaftPort)
 		configuration := raft.Configuration{
 			Servers: []raft.Server{
 				{
 					ID:      config.LocalID,
-					Address: transport.LocalAddr(),
+					Address: raft.ServerAddress(conf.RaftPort),
 				},
 			},
 		}
@@ -107,9 +112,9 @@ func NewRaftNode(conf RaftConfig, fsm *BrokerFSM, logger *slog.Logger) (*RaftNod
 	}
 
 	return &RaftNode{
-		Raft:   r,
-		logger: logger,
-		config: conf,
+		Raft:     r,
+		logger:   logger,
+		config:   conf,
 		hasState: hasState,
 	}, nil
 }
@@ -157,5 +162,5 @@ func (rn *RaftNode) IsLeader() bool {
 }
 
 func (rn *RaftNode) HasState() bool {
-    return rn.hasState
+	return rn.hasState
 }

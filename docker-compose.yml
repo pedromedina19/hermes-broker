@@ -1,6 +1,9 @@
+version: '3.8'
+
 services:
   hermes-1:
-    build: .
+    build: 
+      context: /Users/pedromedina/Documents/projetos/go/hermes-broker
     image: hermes-broker:latest
     hostname: hermes-1
     container_name: hermes-1
@@ -8,9 +11,9 @@ services:
       - "50051:50051"
       - "8080:8080"
     environment:
-      - HERMES_NODE_ID=node-1
+      - HERMES_NODE_ID=hermes-1
       - HERMES_BUFFER_SIZE=20000
-      - HERMES_RAFT_PORT=172.20.0.10:6000
+      - HERMES_RAFT_PORT=hermes-1.hermes-internal:6000 
       - HERMES_GRPC_PORT=:50051
       - HERMES_HTTP_PORT=:8080
       - HERMES_BOOTSTRAP=true
@@ -18,7 +21,8 @@ services:
       - ./data/node-1:/root/data
     networks:
       hermes-net:
-        ipv4_address: 172.20.0.10
+        aliases:
+          - hermes-1.hermes-internal
 
   hermes-2:
     image: hermes-broker:latest
@@ -30,18 +34,19 @@ services:
       - "50052:50051"
       - "8081:8080"
     environment:
-      - HERMES_NODE_ID=node-2
+      - HERMES_NODE_ID=hermes-2
       - HERMES_BUFFER_SIZE=20000
-      - HERMES_RAFT_PORT=172.20.0.11:6000
+      - HERMES_RAFT_PORT=hermes-2.hermes-internal:6000
       - HERMES_GRPC_PORT=:50051
       - HERMES_HTTP_PORT=:8080
       - HERMES_BOOTSTRAP=false
-      - HERMES_JOIN_ADDR=172.20.0.10:8080
+      - HERMES_JOIN_ADDR=hermes-1.hermes-internal:8080
     volumes:
       - ./data/node-2:/root/data
     networks:
       hermes-net:
-        ipv4_address: 172.20.0.11
+        aliases:
+          - hermes-2.hermes-internal
 
   hermes-3:
     image: hermes-broker:latest
@@ -53,22 +58,20 @@ services:
       - "50053:50051"
       - "8082:8080"
     environment:
-      - HERMES_NODE_ID=node-3
+      - HERMES_NODE_ID=hermes-3
       - HERMES_BUFFER_SIZE=20000
-      - HERMES_RAFT_PORT=172.20.0.12:6000
+      - HERMES_RAFT_PORT=hermes-3.hermes-internal:6000
       - HERMES_GRPC_PORT=:50051
       - HERMES_HTTP_PORT=:8080
       - HERMES_BOOTSTRAP=false
-      - HERMES_JOIN_ADDR=172.20.0.10:8080
+      - HERMES_JOIN_ADDR=hermes-1.hermes-internal:8080
     volumes:
       - ./data/node-3:/root/data
     networks:
       hermes-net:
-        ipv4_address: 172.20.0.12
+        aliases:
+          - hermes-3.hermes-internal
 
 networks:
   hermes-net:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16

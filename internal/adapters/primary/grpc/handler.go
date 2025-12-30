@@ -25,7 +25,7 @@ func NewGrpcHandler(service *services.BrokerService, logger *slog.Logger) *GrpcH
 }
 
 func (h *GrpcHandler) Publish(ctx context.Context, req *pb.PublishRequest) (*pb.PublishResponse, error) {
-	err := h.service.Publish(ctx, req.Topic, req.Payload)
+	err := h.service.Publish(ctx, req.Topic, req.Payload, req.Mode)
 	if err != nil {
 		h.logger.Error("Failed to publish", "error", err)
 		return &pb.PublishResponse{Success: false}, status.Error(codes.Internal, err.Error())

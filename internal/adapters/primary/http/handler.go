@@ -8,6 +8,7 @@ import (
 	"github.com/pedromedina19/hermes-broker/internal/adapters/secondary/config"
 	"github.com/pedromedina19/hermes-broker/internal/core/metrics"
 	"github.com/pedromedina19/hermes-broker/internal/core/services"
+	"github.com/pedromedina19/hermes-broker/pb"
 )
 
 type RestHandler struct {
@@ -28,6 +29,7 @@ func NewRestHandler(service *services.BrokerService, cfg config.Config) *RestHan
 type PublishRequest struct {
 	Topic   string `json:"topic"`
 	Payload string `json:"payload"`
+	Mode    int    `json:"mode"`
 }
 
 func (h *RestHandler) HandlePublish(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +49,9 @@ func (h *RestHandler) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := h.service.Publish(r.Context(), req.Topic, []byte(req.Payload))
+	deliveryMode := pb.DeliveryMode(req.Mode)
+
+	err := h.service.Publish(r.Context(), req.Topic, []byte(req.Payload), deliveryMode)
 	if err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return

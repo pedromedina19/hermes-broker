@@ -15,9 +15,15 @@ service BrokerService {
   rpc Join (JoinRequest) returns (JoinResponse);
 }
 
+enum DeliveryMode {
+  CONSISTENT = 0;  // Standard: Goes through Raft (Slow, Safe)
+  PERFORMANCE = 1; // Skip Raft, direct recording on Leader (fast)
+}
+
 message PublishRequest {
   string topic = 1;
   bytes payload = 2; // Raw binary data (serialized JSON or anything else)
+  DeliveryMode mode = 3;
 }
 
 message PublishResponse {

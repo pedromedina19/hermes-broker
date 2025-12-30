@@ -15,3 +15,5 @@ spec:
       port: 6000
     - name: http
       port: 8080
+    - name: grpc
+      port: 50051

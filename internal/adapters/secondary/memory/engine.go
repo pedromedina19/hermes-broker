@@ -4,7 +4,6 @@ import (
 	"context"
 	"hash/fnv"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,13 +16,13 @@ import (
 )
 
 const (
-	AckTimeout = 60 * time.Second
-	MaxRetries = 3
+	AckTimeout = 30 * time.Minute
+	MaxRetries = 10
 	DlqTopic   = "hermes.dlq"
 
-	BatchSize  = 1000 // Reads large blocks of the disc.
-	ShardCount = 64   // to reduce ACK lock contention
-	ChannelBuf = 5000 // Output channel buffer
+	BatchSize  = 2000
+	ShardCount = 64
+	ChannelBuf = 20000
 )
 
 type PendingMessage struct {
@@ -32,13 +31,15 @@ type PendingMessage struct {
 }
 
 type Subscriber struct {
-	ID            string
-	GroupID       string
-	Channel       chan domain.Message
+	ID      string
+	GroupID string
+	Channel chan domain.Message
+
 	CurrentOffset uint64
-	quit          chan struct{}
-	// BYPASS: Channel for receiving "hot" data directly from Publish
-	liveChan chan domain.Message
+	AckedCount    uint64
+	StartOffset   uint64
+
+	quit chan struct{}
 }
 
 type AckShard struct {
@@ -47,16 +48,13 @@ type AckShard struct {
 }
 
 type HybridBroker struct {
-	store ports.LocalLogStore
-
-	subsMu sync.RWMutex
-	subs   map[string]map[string]*Subscriber
-
+	store     ports.LocalLogStore
+	subsMu    sync.RWMutex
+	subs      map[string]map[string]*Subscriber
 	ackShards []*AckShard
-
-	logger ports.Logger
-	ctx    context.Context
-	cancel context.CancelFunc
+	logger    ports.Logger
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 func NewHybridBroker(dataDir string, bufferSize int, logger ports.Logger) *HybridBroker {
@@ -100,33 +98,19 @@ func (b *HybridBroker) Publish(ctx context.Context, msg domain.Message) error {
 	if msg.ID == "" {
 		msg.ID = uuid.New().String()
 	}
-
-	// Persistence
 	_, err := b.store.Append(msg)
-	if err != nil {
-		return err
-	}
-
-	// Bypass (Fast Delivery)
-	b.broadcastToMemory(msg)
-
-	return nil
+	return err
 }
 
-func (b *HybridBroker) broadcastToMemory(msg domain.Message) {
-	b.subsMu.RLock()
-	defer b.subsMu.RUnlock()
-
-	if subs, ok := b.subs[msg.Topic]; ok {
-		for _, sub := range subs {
-			select {
-			case sub.liveChan <- msg:
-			default:
-				// Buffer full, we drop it silently. The sub will pick it up from disk
-			}
-		}
-	}
+func (b *HybridBroker) PublishBatch(ctx context.Context, msgs []*domain.Message) error {
+    for _, msg := range msgs {
+        if msg.ID == "" {
+            msg.ID = uuid.New().String()
+        }
+    }
+    return b.store.AppendBatch(msgs)
 }
+
 
 func (b *HybridBroker) Subscribe(ctx context.Context, topic string, groupID string) (<-chan domain.Message, string, error) {
 	b.subsMu.Lock()
@@ -140,7 +124,6 @@ func (b *HybridBroker) Subscribe(ctx context.Context, topic string, groupID stri
 	subID := uuid.New().String()
 
 	var startOffset uint64
-
 	switch groupID {
 	case "":
 		startOffset = b.store.LastOffset(topic) + 1
@@ -155,104 +138,89 @@ func (b *HybridBroker) Subscribe(ctx context.Context, topic string, groupID stri
 		}
 	}
 
-	liveChan := make(chan domain.Message, 5000)
-
 	sub := &Subscriber{
 		ID:            subID,
 		GroupID:       groupID,
 		Channel:       ch,
 		CurrentOffset: startOffset,
+		StartOffset:   startOffset,
 		quit:          make(chan struct{}),
-		liveChan:      liveChan,
 	}
 
 	b.subs[topic][subID] = sub
-	b.logger.Info("Subscriber connected", "id", subID, "start_offset", startOffset, "group", groupID)
+	b.logger.Info("Subscriber connected (Disk Mode)", "id", subID, "start_offset", startOffset, "group", groupID)
 
-	go b.runSubscriberPump(sub, topic)
-	atomic.AddInt64(&metrics.ActiveSubscribers, 1)
+	go b.runDiskPump(sub, topic)
+	go b.runOffsetCommitter(sub, topic)
+
+	metrics.UpdateSubscribers(topic, 1)
 	return ch, subID, nil
 }
 
-func (b *HybridBroker) runSubscriberPump(sub *Subscriber, topic string) {
-	// Auto-Commit
-	commitTicker := time.NewTicker(1 * time.Second)
-	defer commitTicker.Stop()
-
+func (b *HybridBroker) runDiskPump(sub *Subscriber, topic string) {
 	for {
 		select {
 		case <-b.ctx.Done():
 			return
 		case <-sub.quit:
 			return
+		default:
+		}
 
-		case <-commitTicker.C:
-			if sub.GroupID != "" && sub.GroupID != "__REPLAY__" {
-				b.store.SaveOffset(topic, sub.GroupID, sub.CurrentOffset-1)
-			}
+		current := atomic.LoadUint64(&sub.CurrentOffset)
 
-		// HOT PATH: Try reading from memory first
-		case msg := <-sub.liveChan:
+		msgs, nextOffset, err := b.store.ReadBatch(topic, current, BatchSize)
+		if err != nil {
+			b.logger.Error("Disk Read Error", "err", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		if len(msgs) == 0 {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		for _, msg := range msgs {
+			b.trackPending(sub.ID, msg)
+
 			select {
 			case sub.Channel <- msg:
-				b.trackPending(sub.ID, msg)
-				sub.CurrentOffset++
+				// success
 			case <-b.ctx.Done():
 				return
 			case <-sub.quit:
 				return
 			}
-			continue
-
-		default:
 		}
 
-		// COLD PATH: Checks if we are behind schedule with the disk
-		lastOffset := b.store.LastOffset(topic)
-		if lastOffset >= sub.CurrentOffset {
-			processedCount := b.processFromDisk(sub, topic)
-			if processedCount > 0 {
-				drainChannel(sub.liveChan)
-				runtime.Gosched()
-				continue
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
+		atomic.StoreUint64(&sub.CurrentOffset, nextOffset)
 	}
 }
 
-func (b *HybridBroker) processFromDisk(sub *Subscriber, topic string) int {
-	msgs, nextOffset, err := b.store.ReadBatch(topic, sub.CurrentOffset, BatchSize)
-	if err != nil {
-		b.logger.Error("Disk Read Error", "err", err)
-		return 0
+func (b *HybridBroker) runOffsetCommitter(sub *Subscriber, topic string) {
+	if sub.GroupID == "" || sub.GroupID == "__REPLAY__" {
+		return
 	}
 
-	if len(msgs) == 0 {
-		return 0
-	}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
 
-	for _, msg := range msgs {
-		select {
-		case sub.Channel <- msg:
-			b.trackPending(sub.ID, msg)
-		case <-b.ctx.Done():
-			return 0
-		case <-sub.quit:
-			return 0
-		}
-	}
-
-	sub.CurrentOffset = nextOffset
-	return len(msgs)
-}
-
-func drainChannel(ch <-chan domain.Message) {
 	for {
 		select {
-		case <-ch:
-		default:
+		case <-b.ctx.Done():
 			return
+		case <-sub.quit:
+			return
+		case <-ticker.C:
+			acked := atomic.LoadUint64(&sub.AckedCount)
+			if acked > 0 {
+				newOffset := sub.StartOffset + acked - 1
+				err := b.store.SaveOffset(topic, sub.GroupID, newOffset)
+				if err != nil {
+					b.logger.Error("Failed to save offset", "err", err)
+				}
+			}
 		}
 	}
 }
@@ -268,14 +236,28 @@ func (b *HybridBroker) trackPending(subID string, msg domain.Message) {
 		SentAt: time.Now(),
 	}
 	shard.mu.Unlock()
-	atomic.AddUint64(&metrics.ConsumedCount, 1)
+	metrics.IncConsumed(msg.Topic, 1)
 }
 
 func (b *HybridBroker) Acknowledge(subID, msgID string) {
 	shard := b.getAckShard(subID)
 	shard.mu.Lock()
+
 	if msgs, ok := shard.pendingAcks[subID]; ok {
-		delete(msgs, msgID)
+		if _, exists := msgs[msgID]; exists {
+			delete(msgs, msgID)
+			shard.mu.Unlock()
+
+			b.subsMu.RLock()
+			for _, subs := range b.subs {
+				if sub, ok := subs[subID]; ok {
+					atomic.AddUint64(&sub.AckedCount, 1)
+					break
+				}
+			}
+			b.subsMu.RUnlock()
+			return
+		}
 	}
 	shard.mu.Unlock()
 }
@@ -387,7 +369,7 @@ func (b *HybridBroker) Unsubscribe(topic string, subID string) {
 	shard.mu.Unlock()
 
 	b.logger.Info("Subscriber removed gracefully", "topic", topic, "id", subID)
-	atomic.AddInt64(&metrics.ActiveSubscribers, -1)
+	metrics.UpdateSubscribers(topic, -1)
 }
 
 func (b *HybridBroker) Close() {

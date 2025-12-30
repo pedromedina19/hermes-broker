@@ -2,6 +2,13 @@
 
 package model
 
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"strconv"
+)
+
 type Message struct {
 	ID        string `json:"id"`
 	Topic     string `json:"topic"`
@@ -20,4 +27,59 @@ type Query struct {
 }
 
 type Subscription struct {
+}
+
+type DeliveryMode string
+
+const (
+	DeliveryModeConsistent  DeliveryMode = "CONSISTENT"
+	DeliveryModePerformance DeliveryMode = "PERFORMANCE"
+)
+
+var AllDeliveryMode = []DeliveryMode{
+	DeliveryModeConsistent,
+	DeliveryModePerformance,
+}
+
+func (e DeliveryMode) IsValid() bool {
+	switch e {
+	case DeliveryModeConsistent, DeliveryModePerformance:
+		return true
+	}
+	return false
+}
+
+func (e DeliveryMode) String() string {
+	return string(e)
+}
+
+func (e *DeliveryMode) UnmarshalGQL(v any) error {
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("enums must be strings")
+	}
+
+	*e = DeliveryMode(str)
+	if !e.IsValid() {
+		return fmt.Errorf("%s is not a valid DeliveryMode", str)
+	}
+	return nil
+}
+
+func (e DeliveryMode) MarshalGQL(w io.Writer) {
+	fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
+func (e *DeliveryMode) UnmarshalJSON(b []byte) error {
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return err
+	}
+	return e.UnmarshalGQL(s)
+}
+
+func (e DeliveryMode) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	e.MarshalGQL(&buf)
+	return buf.Bytes(), nil
 }

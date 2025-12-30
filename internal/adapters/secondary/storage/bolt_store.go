@@ -1,13 +1,13 @@
 package storage
 
 import (
-    "encoding/binary"
-    "encoding/json"
-    "sync"
-    "time"
+	"encoding/binary"
+	"encoding/json"
+	"sync"
+	"time"
 
-    "github.com/pedromedina19/hermes-broker/internal/core/domain"
-    bolt "go.etcd.io/bbolt"
+	"github.com/pedromedina19/hermes-broker/internal/core/domain"
+	bolt "go.etcd.io/bbolt"
 )
 
 type BoltLogStore struct {
@@ -44,6 +44,26 @@ func (s *BoltLogStore) Append(msg domain.Message) (uint64, error) {
         return b.Put(itob(id), data)
     })
     return id, err
+}
+
+func (s *BoltLogStore) AppendBatch(msgs []*domain.Message) error {
+    return s.db.Update(func(tx *bolt.Tx) error {
+        for _, msg := range msgs {
+            b, err := tx.CreateBucketIfNotExists([]byte(msg.Topic))
+            if err != nil {
+                return err
+            }
+            id, _ := b.NextSequence()
+            data, err := json.Marshal(msg)
+            if err != nil {
+                return err
+            }
+            if err := b.Put(itob(id), data); err != nil {
+                return err
+            }
+        }
+        return nil
+    })
 }
 
 func (s *BoltLogStore) ReadBatch(topic string, startOffset uint64, limit int) ([]domain.Message, uint64, error) {
@@ -110,6 +130,7 @@ const OffsetsBucket = "consumer_offsets"
 
 // key: "topic:groupID" -> value: offset (uint64)
 func (s *BoltLogStore) SaveOffset(topic, groupID string, offset uint64) error {
+    //log.Printf("Saving Offset topic=%s group=%s offset=%d", topic, groupID, offset)
     return s.db.Update(func(tx *bolt.Tx) error {
         b, err := tx.CreateBucketIfNotExists([]byte(OffsetsBucket))
         if err != nil {

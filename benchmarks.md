@@ -115,3 +115,34 @@ After implementing **Connection Pooling** in the Proxy layer and **Non-blocking 
 1. **gRPC Connection Reuse:** The Internal Proxy now maintains persistent connections to the Leader, eliminating TCP handshake overhead.
 2. **Atomic Metrics:** Real-time stats without using expensive Mutexes.
 3. **Dedicated Sub-Targeting:** Capability to verify replication lag by consuming from any node in the cluster.
+
+
+how to run in cluster
+
+kubectl run bench-runner --image=golang:1.25 --restart=Never -- sleep infinity
+
+kubectl cp . bench-runner:/app
+
+kubectl exec -it bench-runner -- bash -c "cd /app && \
+go run cmd/benchmark/main.go \
+  -scenario=live \
+  -workers=60 \
+  -duration=30s \
+  -mode=performance \
+  -grpc-targets='hermes-0.hermes-internal:50051,hermes-1.hermes-internal:50051,hermes-2.hermes-internal:50051' \
+  -sub-target='hermes-0.hermes-internal:50051'"
+
+
+kubectl exec -it bench-runner -- bash -c "cd /app && \
+go run cmd/benchmark/main.go \
+  -scenario=live \
+  -workers=60 \
+  -duration=30s \
+  -mode=consistent \
+  -grpc-targets='hermes-0.hermes-internal:50051,hermes-1.hermes-internal:50051,hermes-2.hermes-internal:50051' \
+  -sub-target='hermes-0.hermes-internal:50051'"
+
+
+
+
+kubectl delete pod bench-runner

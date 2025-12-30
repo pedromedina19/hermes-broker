@@ -1,3 +1,8 @@
+enum DeliveryMode {
+  CONSISTENT
+  PERFORMANCE
+}
+
 type Message {
   id: ID!
   topic: String!
@@ -14,7 +19,7 @@ type Query {
 }
 
 type Mutation {
-  publish(topic: String!, payload: String!): PublishResponse!
+  publish(topic: String!, payload: String!, mode: DeliveryMode): PublishResponse!
 }
 
 type Subscription {

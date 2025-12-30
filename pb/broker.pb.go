@@ -21,10 +21,57 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type DeliveryMode int32
+
+const (
+	DeliveryMode_CONSISTENT  DeliveryMode = 0 // Padrão: Passa pelo Raft (Lento, Seguro)
+	DeliveryMode_PERFORMANCE DeliveryMode = 1 // Novo: Pula o Raft, grava direto no Líder (Rápido)
+)
+
+// Enum value maps for DeliveryMode.
+var (
+	DeliveryMode_name = map[int32]string{
+		0: "CONSISTENT",
+		1: "PERFORMANCE",
+	}
+	DeliveryMode_value = map[string]int32{
+		"CONSISTENT":  0,
+		"PERFORMANCE": 1,
+	}
+)
+
+func (x DeliveryMode) Enum() *DeliveryMode {
+	p := new(DeliveryMode)
+	*p = x
+	return p
+}
+
+func (x DeliveryMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (DeliveryMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_broker_proto_enumTypes[0].Descriptor()
+}
+
+func (DeliveryMode) Type() protoreflect.EnumType {
+	return &file_proto_broker_proto_enumTypes[0]
+}
+
+func (x DeliveryMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use DeliveryMode.Descriptor instead.
+func (DeliveryMode) EnumDescriptor() ([]byte, []int) {
+	return file_proto_broker_proto_rawDescGZIP(), []int{0}
+}
+
 type PublishRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Topic         string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
 	Payload       []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"` // Raw binary data (serialized JSON or anything else)
+	Mode          DeliveryMode           `protobuf:"varint,3,opt,name=mode,proto3,enum=broker.DeliveryMode" json:"mode,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -71,6 +118,13 @@ func (x *PublishRequest) GetPayload() []byte {
 		return x.Payload
 	}
 	return nil
+}
+
+func (x *PublishRequest) GetMode() DeliveryMode {
+	if x != nil {
+		return x.Mode
+	}
+	return DeliveryMode_CONSISTENT
 }
 
 type PublishResponse struct {
@@ -361,10 +415,11 @@ var File_proto_broker_proto protoreflect.FileDescriptor
 
 const file_proto_broker_proto_rawDesc = "" +
 	"\n" +
-	"\x12proto/broker.proto\x12\x06broker\"@\n" +
+	"\x12proto/broker.proto\x12\x06broker\"j\n" +
 	"\x0ePublishRequest\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x18\n" +
-	"\apayload\x18\x02 \x01(\fR\apayload\"+\n" +
+	"\apayload\x18\x02 \x01(\fR\apayload\x12(\n" +
+	"\x04mode\x18\x03 \x01(\x0e2\x14.broker.DeliveryModeR\x04mode\"+\n" +
 	"\x0fPublishResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\"\x81\x01\n" +
 	"\x10SubscribeRequest\x12\x14\n" +
@@ -382,7 +437,11 @@ const file_proto_broker_proto_rawDesc = "" +
 	"\traft_addr\x18\x02 \x01(\tR\braftAddr\">\n" +
 	"\fJoinResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error2\xba\x01\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error*/\n" +
+	"\fDeliveryMode\x12\x0e\n" +
+	"\n" +
+	"CONSISTENT\x10\x00\x12\x0f\n" +
+	"\vPERFORMANCE\x10\x012\xba\x01\n" +
 	"\rBrokerService\x12:\n" +
 	"\aPublish\x12\x16.broker.PublishRequest\x1a\x17.broker.PublishResponse\x12:\n" +
 	"\tSubscribe\x12\x18.broker.SubscribeRequest\x1a\x0f.broker.Message(\x010\x01\x121\n" +
@@ -400,27 +459,30 @@ func file_proto_broker_proto_rawDescGZIP() []byte {
 	return file_proto_broker_proto_rawDescData
 }
 
+var file_proto_broker_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_proto_broker_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_proto_broker_proto_goTypes = []any{
-	(*PublishRequest)(nil),   // 0: broker.PublishRequest
-	(*PublishResponse)(nil),  // 1: broker.PublishResponse
-	(*SubscribeRequest)(nil), // 2: broker.SubscribeRequest
-	(*Message)(nil),          // 3: broker.Message
-	(*JoinRequest)(nil),      // 4: broker.JoinRequest
-	(*JoinResponse)(nil),     // 5: broker.JoinResponse
+	(DeliveryMode)(0),        // 0: broker.DeliveryMode
+	(*PublishRequest)(nil),   // 1: broker.PublishRequest
+	(*PublishResponse)(nil),  // 2: broker.PublishResponse
+	(*SubscribeRequest)(nil), // 3: broker.SubscribeRequest
+	(*Message)(nil),          // 4: broker.Message
+	(*JoinRequest)(nil),      // 5: broker.JoinRequest
+	(*JoinResponse)(nil),     // 6: broker.JoinResponse
 }
 var file_proto_broker_proto_depIdxs = []int32{
-	0, // 0: broker.BrokerService.Publish:input_type -> broker.PublishRequest
-	2, // 1: broker.BrokerService.Subscribe:input_type -> broker.SubscribeRequest
-	4, // 2: broker.BrokerService.Join:input_type -> broker.JoinRequest
-	1, // 3: broker.BrokerService.Publish:output_type -> broker.PublishResponse
-	3, // 4: broker.BrokerService.Subscribe:output_type -> broker.Message
-	5, // 5: broker.BrokerService.Join:output_type -> broker.JoinResponse
-	3, // [3:6] is the sub-list for method output_type
-	0, // [0:3] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	0, // 0: broker.PublishRequest.mode:type_name -> broker.DeliveryMode
+	1, // 1: broker.BrokerService.Publish:input_type -> broker.PublishRequest
+	3, // 2: broker.BrokerService.Subscribe:input_type -> broker.SubscribeRequest
+	5, // 3: broker.BrokerService.Join:input_type -> broker.JoinRequest
+	2, // 4: broker.BrokerService.Publish:output_type -> broker.PublishResponse
+	4, // 5: broker.BrokerService.Subscribe:output_type -> broker.Message
+	6, // 6: broker.BrokerService.Join:output_type -> broker.JoinResponse
+	4, // [4:7] is the sub-list for method output_type
+	1, // [1:4] is the sub-list for method input_type
+	1, // [1:1] is the sub-list for extension type_name
+	1, // [1:1] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_proto_broker_proto_init() }
@@ -433,13 +495,14 @@ func file_proto_broker_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_broker_proto_rawDesc), len(file_proto_broker_proto_rawDesc)),
-			NumEnums:      0,
+			NumEnums:      1,
 			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_proto_broker_proto_goTypes,
 		DependencyIndexes: file_proto_broker_proto_depIdxs,
+		EnumInfos:         file_proto_broker_proto_enumTypes,
 		MessageInfos:      file_proto_broker_proto_msgTypes,
 	}.Build()
 	File_proto_broker_proto = out.File

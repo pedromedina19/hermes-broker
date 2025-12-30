@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
-	"sync/atomic"
 
 	"github.com/hashicorp/raft"
 	"github.com/pedromedina19/hermes-broker/internal/core/domain"
@@ -42,7 +41,7 @@ func (fsm *BrokerFSM) Apply(l *raft.Log) interface{} {
 		if err := fsm.engine.Publish(context.TODO(), msg); err != nil {
 			fsm.logger.Error("FSM: Failed to publish to engine", "id", msg.ID, "error", err)
 		}
-		atomic.AddUint64(&metrics.PublishedCount, 1)
+		metrics.IncPublished(msg.Topic, 1)
 	}
 
 	return nil

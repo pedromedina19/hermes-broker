@@ -30,3 +30,11 @@ The server will start on port `:50051` and recover any state from `hermes.wal`.
 
 ```bash
 go run cmd/server/main.go
+
+
+
+protoc --go_out=. --go-grpc_out=. pb/broker.proto
+
+
+go get github.com/99designs/gqlgen@v0.17.85
+go run github.com/99designs/gqlgen generate

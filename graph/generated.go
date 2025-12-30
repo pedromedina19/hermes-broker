@@ -56,7 +56,7 @@ type ComplexityRoot struct {
 	}
 
 	Mutation struct {
-		Publish func(childComplexity int, topic string, payload string) int
+		Publish func(childComplexity int, topic string, payload string, mode *model.DeliveryMode) int
 	}
 
 	PublishResponse struct {
@@ -73,7 +73,7 @@ type ComplexityRoot struct {
 }
 
 type MutationResolver interface {
-	Publish(ctx context.Context, topic string, payload string) (*model.PublishResponse, error)
+	Publish(ctx context.Context, topic string, payload string, mode *model.DeliveryMode) (*model.PublishResponse, error)
 }
 type QueryResolver interface {
 	Health(ctx context.Context) (string, error)
@@ -136,7 +136,7 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 			return 0, false
 		}
 
-		return e.complexity.Mutation.Publish(childComplexity, args["topic"].(string), args["payload"].(string)), true
+		return e.complexity.Mutation.Publish(childComplexity, args["topic"].(string), args["payload"].(string), args["mode"].(*model.DeliveryMode)), true
 
 	case "PublishResponse.success":
 		if e.complexity.PublishResponse.Success == nil {
@@ -317,6 +317,11 @@ func (ec *executionContext) field_Mutation_publish_args(ctx context.Context, raw
 		return nil, err
 	}
 	args["payload"] = arg1
+	arg2, err := graphql.ProcessArgField(ctx, rawArgs, "mode", ec.unmarshalODeliveryMode2ᚖgithubᚗcomᚋpedromedina19ᚋhermesᚑbrokerᚋgraphᚋmodelᚐDeliveryMode)
+	if err != nil {
+		return nil, err
+	}
+	args["mode"] = arg2
 	return args, nil
 }
 
@@ -523,7 +528,7 @@ func (ec *executionContext) _Mutation_publish(ctx context.Context, field graphql
 		ec.fieldContext_Mutation_publish,
 		func(ctx context.Context) (any, error) {
 			fc := graphql.GetFieldContext(ctx)
-			return ec.resolvers.Mutation().Publish(ctx, fc.Args["topic"].(string), fc.Args["payload"].(string))
+			return ec.resolvers.Mutation().Publish(ctx, fc.Args["topic"].(string), fc.Args["payload"].(string), fc.Args["mode"].(*model.DeliveryMode))
 		},
 		nil,
 		ec.marshalNPublishResponse2ᚖgithubᚗcomᚋpedromedina19ᚋhermesᚑbrokerᚋgraphᚋmodelᚐPublishResponse,
@@ -3173,6 +3178,22 @@ func (ec *executionContext) marshalOBoolean2ᚖbool(ctx context.Context, sel ast
 	_ = ctx
 	res := graphql.MarshalBoolean(*v)
 	return res
+}
+
+func (ec *executionContext) unmarshalODeliveryMode2ᚖgithubᚗcomᚋpedromedina19ᚋhermesᚑbrokerᚋgraphᚋmodelᚐDeliveryMode(ctx context.Context, v any) (*model.DeliveryMode, error) {
+	if v == nil {
+		return nil, nil
+	}
+	var res = new(model.DeliveryMode)
+	err := res.UnmarshalGQL(v)
+	return res, graphql.ErrorOnPath(ctx, err)
+}
+
+func (ec *executionContext) marshalODeliveryMode2ᚖgithubᚗcomᚋpedromedina19ᚋhermesᚑbrokerᚋgraphᚋmodelᚐDeliveryMode(ctx context.Context, sel ast.SelectionSet, v *model.DeliveryMode) graphql.Marshaler {
+	if v == nil {
+		return graphql.Null
+	}
+	return v
 }
 
 func (ec *executionContext) unmarshalOString2ᚖstring(ctx context.Context, v any) (*string, error) {
