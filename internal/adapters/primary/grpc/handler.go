@@ -33,6 +33,41 @@ func (h *GrpcHandler) Publish(ctx context.Context, req *pb.PublishRequest) (*pb.
 	return &pb.PublishResponse{Success: true}, nil
 }
 
+func (h *GrpcHandler) PublishStream(stream pb.BrokerService_PublishStreamServer) error {
+    var processed uint64
+    var failed uint64
+    ctx := stream.Context()
+
+    for {
+        req, err := stream.Recv()
+        
+        if err == io.EOF {
+            return stream.SendAndClose(&pb.PublishSummary{
+                ProcessedCount: processed,
+                FailedCount:    failed,
+            })
+        }
+        if err != nil {
+            h.logger.Error("Stream receive error", "err", err)
+            return err
+        }
+        err = h.service.Publish(ctx, req.Topic, req.Payload, req.Mode)
+        if err != nil {
+            failed++
+        } else {
+            processed++
+        }
+    }
+}
+
+func (h *GrpcHandler) PublishBatch(ctx context.Context, req *pb.PublishBatchRequest) (*pb.PublishResponse, error) {
+    err := h.service.PublishBatchList(ctx, req.Topic, req.Payloads, req.Mode)
+    if err != nil {
+        return &pb.PublishResponse{Success: false}, status.Error(codes.Internal, err.Error())
+    }
+    return &pb.PublishResponse{Success: true}, nil
+}
+
 func (h *GrpcHandler) Subscribe(stream pb.BrokerService_SubscribeServer) error {
 	ctx := stream.Context()
 

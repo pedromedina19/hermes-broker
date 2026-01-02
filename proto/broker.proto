@@ -8,6 +8,12 @@ service BrokerService {
   // Publishing is "Fire and Forget" (Unary)
   rpc Publish (PublishRequest) returns (PublishResponse);
 
+  // O cliente abre um stream e manda milhares de msgs. O servidor responde só no final.
+  rpc PublishStream (stream PublishRequest) returns (PublishSummary);
+
+  // Envia 1 requisição com 1000 mensagens dentro.
+  rpc PublishBatch (PublishBatchRequest) returns (PublishResponse);
+
   // Subscribing is a continuous flow of data (Server-Side Streaming).
   rpc Subscribe (stream SubscribeRequest) returns (stream Message);
 
@@ -16,8 +22,9 @@ service BrokerService {
 }
 
 enum DeliveryMode {
-  CONSISTENT = 0;  // Standard: Goes through Raft (Slow, Safe)
-  PERFORMANCE = 1; // Skip Raft, direct recording on Leader (fast)
+  CONSISTENT = 0;  // Synchronous Raft (Slow, Safe)
+  EVENTUAL   = 1; // Synchronous Local Disk + Asynchronous Replication (Fast, Durable on Crash)
+  PERFORMANCE = 2; // Synchronous Memory + Asynchronous Disk/Replica (Extremely Fast, Risk of Crash)
 }
 
 message PublishRequest {
@@ -28,6 +35,17 @@ message PublishRequest {
 
 message PublishResponse {
   bool success = 1;
+}
+
+message PublishSummary {
+  uint64 processed_count = 1;
+  uint64 failed_count = 2;
+}
+
+message PublishBatchRequest {
+  string topic = 1;
+  repeated bytes payloads = 2; // Array de payloads
+  DeliveryMode mode = 3;
 }
 
 message SubscribeRequest {

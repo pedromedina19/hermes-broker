@@ -33,17 +33,19 @@ type DeliveryMode string
 
 const (
 	DeliveryModeConsistent  DeliveryMode = "CONSISTENT"
+	DeliveryModeEventual    DeliveryMode = "EVENTUAL"
 	DeliveryModePerformance DeliveryMode = "PERFORMANCE"
 )
 
 var AllDeliveryMode = []DeliveryMode{
 	DeliveryModeConsistent,
+	DeliveryModeEventual,
 	DeliveryModePerformance,
 }
 
 func (e DeliveryMode) IsValid() bool {
 	switch e {
-	case DeliveryModeConsistent, DeliveryModePerformance:
+	case DeliveryModeConsistent, DeliveryModeEventual, DeliveryModePerformance:
 		return true
 	}
 	return false

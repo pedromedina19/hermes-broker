@@ -100,6 +100,7 @@ func main() {
 	mux.HandleFunc("/publish", restHandler.HandlePublish) // REST Endpoint
 	mux.HandleFunc("/status", restHandler.HandleStatus)
 	mux.HandleFunc("/join", restHandler.HandleJoin)
+	mux.HandleFunc("/publish/batch", restHandler.HandlePublishBatch)
 	mux.HandleFunc("/subscribe", restHandler.HandleSubscribeSSE)
 	mux.Handle("/query", gqlServer) // GraphQL Endpoint
 	mux.Handle("/", playground.Handler("GraphQL playground", "/query"))

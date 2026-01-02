@@ -33,7 +33,7 @@ go run cmd/server/main.go
 
 
 
-protoc --go_out=. --go-grpc_out=. pb/broker.proto
+protoc --go_out=. --go-grpc_out=. proto/broker.proto
 
 
 go get github.com/99designs/gqlgen@v0.17.85

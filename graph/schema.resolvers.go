@@ -16,12 +16,40 @@ import (
 // Publish is the resolver for the publish field.
 func (r *mutationResolver) Publish(ctx context.Context, topic string, payload string, mode *model.DeliveryMode) (*model.PublishResponse, error) {
 	pbMode := pb.DeliveryMode_CONSISTENT
-	if mode != nil && *mode == model.DeliveryModePerformance {
-		pbMode = pb.DeliveryMode_PERFORMANCE
+	if mode != nil {
+		switch *mode {
+		case model.DeliveryModeEventual:
+			pbMode = pb.DeliveryMode_EVENTUAL
+		case model.DeliveryModePerformance:
+			pbMode = pb.DeliveryMode_PERFORMANCE
+		}
 	}
 	err := r.Service.Publish(ctx, topic, []byte(payload), pbMode)
 	if err != nil {
 		return &model.PublishResponse{Success: false}, fmt.Errorf("failed to publish: %w", err)
+	}
+	return &model.PublishResponse{Success: true}, nil
+}
+
+func (r *mutationResolver) PublishBatch(ctx context.Context, topic string, payloads []string, mode *model.DeliveryMode) (*model.PublishResponse, error) {
+	pbMode := pb.DeliveryMode_CONSISTENT
+	if mode != nil {
+		switch *mode {
+		case model.DeliveryModeEventual:
+			pbMode = pb.DeliveryMode_EVENTUAL
+		case model.DeliveryModePerformance:
+			pbMode = pb.DeliveryMode_PERFORMANCE
+		}
+	}
+
+	data := make([][]byte, len(payloads))
+	for i, p := range payloads {
+		data[i] = []byte(p)
+	}
+
+	err := r.Service.PublishBatchList(ctx, topic, data, pbMode)
+	if err != nil {
+		return &model.PublishResponse{Success: false}, fmt.Errorf("failed to publish batch: %w", err)
 	}
 	return &model.PublishResponse{Success: true}, nil
 }

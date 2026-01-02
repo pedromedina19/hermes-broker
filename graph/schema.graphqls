@@ -1,5 +1,6 @@
 enum DeliveryMode {
   CONSISTENT
+  EVENTUAL
   PERFORMANCE
 }
 
@@ -20,6 +21,7 @@ type Query {
 
 type Mutation {
   publish(topic: String!, payload: String!, mode: DeliveryMode): PublishResponse!
+  publishBatch(topic: String!, payloads: [String!]!, mode: DeliveryMode): PublishResponse!
 }
 
 type Subscription {

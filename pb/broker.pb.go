@@ -24,19 +24,22 @@ const (
 type DeliveryMode int32
 
 const (
-	DeliveryMode_CONSISTENT  DeliveryMode = 0 // Padrão: Passa pelo Raft (Lento, Seguro)
-	DeliveryMode_PERFORMANCE DeliveryMode = 1 // Novo: Pula o Raft, grava direto no Líder (Rápido)
+	DeliveryMode_CONSISTENT  DeliveryMode = 0 // Synchronous Raft (Slow, Safe)
+	DeliveryMode_EVENTUAL    DeliveryMode = 1 // Synchronous Local Disk + Asynchronous Replication (Fast, Durable on Crash)
+	DeliveryMode_PERFORMANCE DeliveryMode = 2 // Synchronous Memory + Asynchronous Disk/Replica (Extremely Fast, Risk of Crash)
 )
 
 // Enum value maps for DeliveryMode.
 var (
 	DeliveryMode_name = map[int32]string{
 		0: "CONSISTENT",
-		1: "PERFORMANCE",
+		1: "EVENTUAL",
+		2: "PERFORMANCE",
 	}
 	DeliveryMode_value = map[string]int32{
 		"CONSISTENT":  0,
-		"PERFORMANCE": 1,
+		"EVENTUAL":    1,
+		"PERFORMANCE": 2,
 	}
 )
 
@@ -171,6 +174,118 @@ func (x *PublishResponse) GetSuccess() bool {
 	return false
 }
 
+type PublishSummary struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	ProcessedCount uint64                 `protobuf:"varint,1,opt,name=processed_count,json=processedCount,proto3" json:"processed_count,omitempty"`
+	FailedCount    uint64                 `protobuf:"varint,2,opt,name=failed_count,json=failedCount,proto3" json:"failed_count,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *PublishSummary) Reset() {
+	*x = PublishSummary{}
+	mi := &file_proto_broker_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PublishSummary) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PublishSummary) ProtoMessage() {}
+
+func (x *PublishSummary) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_broker_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PublishSummary.ProtoReflect.Descriptor instead.
+func (*PublishSummary) Descriptor() ([]byte, []int) {
+	return file_proto_broker_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *PublishSummary) GetProcessedCount() uint64 {
+	if x != nil {
+		return x.ProcessedCount
+	}
+	return 0
+}
+
+func (x *PublishSummary) GetFailedCount() uint64 {
+	if x != nil {
+		return x.FailedCount
+	}
+	return 0
+}
+
+type PublishBatchRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Topic         string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
+	Payloads      [][]byte               `protobuf:"bytes,2,rep,name=payloads,proto3" json:"payloads,omitempty"` // Array de payloads
+	Mode          DeliveryMode           `protobuf:"varint,3,opt,name=mode,proto3,enum=broker.DeliveryMode" json:"mode,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PublishBatchRequest) Reset() {
+	*x = PublishBatchRequest{}
+	mi := &file_proto_broker_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PublishBatchRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PublishBatchRequest) ProtoMessage() {}
+
+func (x *PublishBatchRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_broker_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PublishBatchRequest.ProtoReflect.Descriptor instead.
+func (*PublishBatchRequest) Descriptor() ([]byte, []int) {
+	return file_proto_broker_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *PublishBatchRequest) GetTopic() string {
+	if x != nil {
+		return x.Topic
+	}
+	return ""
+}
+
+func (x *PublishBatchRequest) GetPayloads() [][]byte {
+	if x != nil {
+		return x.Payloads
+	}
+	return nil
+}
+
+func (x *PublishBatchRequest) GetMode() DeliveryMode {
+	if x != nil {
+		return x.Mode
+	}
+	return DeliveryMode_CONSISTENT
+}
+
 type SubscribeRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Topic         string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`                                     // Filled in only on the first package (Handshake)
@@ -183,7 +298,7 @@ type SubscribeRequest struct {
 
 func (x *SubscribeRequest) Reset() {
 	*x = SubscribeRequest{}
-	mi := &file_proto_broker_proto_msgTypes[2]
+	mi := &file_proto_broker_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -195,7 +310,7 @@ func (x *SubscribeRequest) String() string {
 func (*SubscribeRequest) ProtoMessage() {}
 
 func (x *SubscribeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_broker_proto_msgTypes[2]
+	mi := &file_proto_broker_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -208,7 +323,7 @@ func (x *SubscribeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscribeRequest.ProtoReflect.Descriptor instead.
 func (*SubscribeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_broker_proto_rawDescGZIP(), []int{2}
+	return file_proto_broker_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *SubscribeRequest) GetTopic() string {
@@ -251,7 +366,7 @@ type Message struct {
 
 func (x *Message) Reset() {
 	*x = Message{}
-	mi := &file_proto_broker_proto_msgTypes[3]
+	mi := &file_proto_broker_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -263,7 +378,7 @@ func (x *Message) String() string {
 func (*Message) ProtoMessage() {}
 
 func (x *Message) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_broker_proto_msgTypes[3]
+	mi := &file_proto_broker_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -276,7 +391,7 @@ func (x *Message) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Message.ProtoReflect.Descriptor instead.
 func (*Message) Descriptor() ([]byte, []int) {
-	return file_proto_broker_proto_rawDescGZIP(), []int{3}
+	return file_proto_broker_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *Message) GetId() string {
@@ -317,7 +432,7 @@ type JoinRequest struct {
 
 func (x *JoinRequest) Reset() {
 	*x = JoinRequest{}
-	mi := &file_proto_broker_proto_msgTypes[4]
+	mi := &file_proto_broker_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -329,7 +444,7 @@ func (x *JoinRequest) String() string {
 func (*JoinRequest) ProtoMessage() {}
 
 func (x *JoinRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_broker_proto_msgTypes[4]
+	mi := &file_proto_broker_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -342,7 +457,7 @@ func (x *JoinRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JoinRequest.ProtoReflect.Descriptor instead.
 func (*JoinRequest) Descriptor() ([]byte, []int) {
-	return file_proto_broker_proto_rawDescGZIP(), []int{4}
+	return file_proto_broker_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *JoinRequest) GetNodeId() string {
@@ -369,7 +484,7 @@ type JoinResponse struct {
 
 func (x *JoinResponse) Reset() {
 	*x = JoinResponse{}
-	mi := &file_proto_broker_proto_msgTypes[5]
+	mi := &file_proto_broker_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -381,7 +496,7 @@ func (x *JoinResponse) String() string {
 func (*JoinResponse) ProtoMessage() {}
 
 func (x *JoinResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_broker_proto_msgTypes[5]
+	mi := &file_proto_broker_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -394,7 +509,7 @@ func (x *JoinResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JoinResponse.ProtoReflect.Descriptor instead.
 func (*JoinResponse) Descriptor() ([]byte, []int) {
-	return file_proto_broker_proto_rawDescGZIP(), []int{5}
+	return file_proto_broker_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *JoinResponse) GetSuccess() bool {
@@ -421,7 +536,14 @@ const file_proto_broker_proto_rawDesc = "" +
 	"\apayload\x18\x02 \x01(\fR\apayload\x12(\n" +
 	"\x04mode\x18\x03 \x01(\x0e2\x14.broker.DeliveryModeR\x04mode\"+\n" +
 	"\x0fPublishResponse\x12\x18\n" +
-	"\asuccess\x18\x01 \x01(\bR\asuccess\"\x81\x01\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\"\\\n" +
+	"\x0ePublishSummary\x12'\n" +
+	"\x0fprocessed_count\x18\x01 \x01(\x04R\x0eprocessedCount\x12!\n" +
+	"\ffailed_count\x18\x02 \x01(\x04R\vfailedCount\"q\n" +
+	"\x13PublishBatchRequest\x12\x14\n" +
+	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x1a\n" +
+	"\bpayloads\x18\x02 \x03(\fR\bpayloads\x12(\n" +
+	"\x04mode\x18\x03 \x01(\x0e2\x14.broker.DeliveryModeR\x04mode\"\x81\x01\n" +
 	"\x10SubscribeRequest\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12$\n" +
 	"\x0eack_message_id\x18\x02 \x01(\tR\fackMessageId\x12\x16\n" +
@@ -437,13 +559,16 @@ const file_proto_broker_proto_rawDesc = "" +
 	"\traft_addr\x18\x02 \x01(\tR\braftAddr\">\n" +
 	"\fJoinResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error*/\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error*=\n" +
 	"\fDeliveryMode\x12\x0e\n" +
 	"\n" +
-	"CONSISTENT\x10\x00\x12\x0f\n" +
-	"\vPERFORMANCE\x10\x012\xba\x01\n" +
+	"CONSISTENT\x10\x00\x12\f\n" +
+	"\bEVENTUAL\x10\x01\x12\x0f\n" +
+	"\vPERFORMANCE\x10\x022\xc3\x02\n" +
 	"\rBrokerService\x12:\n" +
-	"\aPublish\x12\x16.broker.PublishRequest\x1a\x17.broker.PublishResponse\x12:\n" +
+	"\aPublish\x12\x16.broker.PublishRequest\x1a\x17.broker.PublishResponse\x12A\n" +
+	"\rPublishStream\x12\x16.broker.PublishRequest\x1a\x16.broker.PublishSummary(\x01\x12D\n" +
+	"\fPublishBatch\x12\x1b.broker.PublishBatchRequest\x1a\x17.broker.PublishResponse\x12:\n" +
 	"\tSubscribe\x12\x18.broker.SubscribeRequest\x1a\x0f.broker.Message(\x010\x01\x121\n" +
 	"\x04Join\x12\x13.broker.JoinRequest\x1a\x14.broker.JoinResponseB+Z)github.com/pedromedina19/hermes-broker/pbb\x06proto3"
 
@@ -460,29 +585,36 @@ func file_proto_broker_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_broker_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_broker_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_proto_broker_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_proto_broker_proto_goTypes = []any{
-	(DeliveryMode)(0),        // 0: broker.DeliveryMode
-	(*PublishRequest)(nil),   // 1: broker.PublishRequest
-	(*PublishResponse)(nil),  // 2: broker.PublishResponse
-	(*SubscribeRequest)(nil), // 3: broker.SubscribeRequest
-	(*Message)(nil),          // 4: broker.Message
-	(*JoinRequest)(nil),      // 5: broker.JoinRequest
-	(*JoinResponse)(nil),     // 6: broker.JoinResponse
+	(DeliveryMode)(0),           // 0: broker.DeliveryMode
+	(*PublishRequest)(nil),      // 1: broker.PublishRequest
+	(*PublishResponse)(nil),     // 2: broker.PublishResponse
+	(*PublishSummary)(nil),      // 3: broker.PublishSummary
+	(*PublishBatchRequest)(nil), // 4: broker.PublishBatchRequest
+	(*SubscribeRequest)(nil),    // 5: broker.SubscribeRequest
+	(*Message)(nil),             // 6: broker.Message
+	(*JoinRequest)(nil),         // 7: broker.JoinRequest
+	(*JoinResponse)(nil),        // 8: broker.JoinResponse
 }
 var file_proto_broker_proto_depIdxs = []int32{
 	0, // 0: broker.PublishRequest.mode:type_name -> broker.DeliveryMode
-	1, // 1: broker.BrokerService.Publish:input_type -> broker.PublishRequest
-	3, // 2: broker.BrokerService.Subscribe:input_type -> broker.SubscribeRequest
-	5, // 3: broker.BrokerService.Join:input_type -> broker.JoinRequest
-	2, // 4: broker.BrokerService.Publish:output_type -> broker.PublishResponse
-	4, // 5: broker.BrokerService.Subscribe:output_type -> broker.Message
-	6, // 6: broker.BrokerService.Join:output_type -> broker.JoinResponse
-	4, // [4:7] is the sub-list for method output_type
-	1, // [1:4] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	0, // 1: broker.PublishBatchRequest.mode:type_name -> broker.DeliveryMode
+	1, // 2: broker.BrokerService.Publish:input_type -> broker.PublishRequest
+	1, // 3: broker.BrokerService.PublishStream:input_type -> broker.PublishRequest
+	4, // 4: broker.BrokerService.PublishBatch:input_type -> broker.PublishBatchRequest
+	5, // 5: broker.BrokerService.Subscribe:input_type -> broker.SubscribeRequest
+	7, // 6: broker.BrokerService.Join:input_type -> broker.JoinRequest
+	2, // 7: broker.BrokerService.Publish:output_type -> broker.PublishResponse
+	3, // 8: broker.BrokerService.PublishStream:output_type -> broker.PublishSummary
+	2, // 9: broker.BrokerService.PublishBatch:output_type -> broker.PublishResponse
+	6, // 10: broker.BrokerService.Subscribe:output_type -> broker.Message
+	8, // 11: broker.BrokerService.Join:output_type -> broker.JoinResponse
+	7, // [7:12] is the sub-list for method output_type
+	2, // [2:7] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_proto_broker_proto_init() }
@@ -496,7 +628,7 @@ func file_proto_broker_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_broker_proto_rawDesc), len(file_proto_broker_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   6,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

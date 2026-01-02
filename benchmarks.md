@@ -119,6 +119,8 @@ After implementing **Connection Pooling** in the Proxy layer and **Non-blocking 
 
 how to run in cluster
 
+kubectl apply -f ./cloud-build/bench-runner-isolated.yaml
+ou
 kubectl run bench-runner --image=golang:1.25 --restart=Never -- sleep infinity
 
 kubectl cp . bench-runner:/app
@@ -132,6 +134,14 @@ go run cmd/benchmark/main.go \
   -grpc-targets='hermes-0.hermes-internal:50051,hermes-1.hermes-internal:50051,hermes-2.hermes-internal:50051' \
   -sub-target='hermes-0.hermes-internal:50051'"
 
+kubectl exec -it bench-runner -- bash -c "cd /app && \
+go run cmd/benchmark/main.go \
+  -scenario=live \
+  -workers=60 \
+  -duration=30s \
+  -mode=eventual \
+  -grpc-targets='hermes-0.hermes-internal:50051,hermes-1.hermes-internal:50051,hermes-2.hermes-internal:50051' \
+  -sub-target='hermes-0.hermes-internal:50051'"
 
 kubectl exec -it bench-runner -- bash -c "cd /app && \
 go run cmd/benchmark/main.go \
@@ -140,6 +150,16 @@ go run cmd/benchmark/main.go \
   -duration=30s \
   -mode=consistent \
   -grpc-targets='hermes-0.hermes-internal:50051,hermes-1.hermes-internal:50051,hermes-2.hermes-internal:50051' \
+  -sub-target='hermes-0.hermes-internal:50051'"
+
+kubectl exec -it bench-runner -- bash -c "cd /app && \
+go run cmd/benchmark/main.go \
+  -scenario=live \
+  -workers=100 \
+  -duration=30s \
+  -mode=performance \
+  -protocol=grpc-stream \
+  -grpc-targets='hermes-0.hermes-internal:50051' \
   -sub-target='hermes-0.hermes-internal:50051'"
 
 

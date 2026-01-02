@@ -22,7 +22,7 @@ const (
 
 	BatchSize  = 2000
 	ShardCount = 64
-	ChannelBuf = 20000
+	ChannelBuf = 100000
 )
 
 type PendingMessage struct {
@@ -48,13 +48,13 @@ type AckShard struct {
 }
 
 type HybridBroker struct {
-	store     ports.LocalLogStore
-	subsMu    sync.RWMutex
-	subs      map[string]map[string]*Subscriber
-	ackShards []*AckShard
-	logger    ports.Logger
-	ctx       context.Context
-	cancel    context.CancelFunc
+	store           ports.LocalLogStore
+	subsMu          sync.RWMutex
+	subs            map[string]map[string]*Subscriber
+	ackShards       []*AckShard
+	logger          ports.Logger
+	ctx             context.Context
+	cancel          context.CancelFunc
 	replicationFunc func(topic, groupID string, offset uint64)
 }
 
@@ -112,14 +112,74 @@ func (b *HybridBroker) Publish(ctx context.Context, msg domain.Message) error {
 }
 
 func (b *HybridBroker) PublishBatch(ctx context.Context, msgs []*domain.Message) error {
-    for _, msg := range msgs {
-        if msg.ID == "" {
-            msg.ID = uuid.New().String()
-        }
-    }
-    return b.store.AppendBatch(msgs)
+	for _, msg := range msgs {
+		if msg.ID == "" {
+			msg.ID = uuid.New().String()
+		}
+	}
+	return b.store.AppendBatch(msgs)
 }
 
+func (b *HybridBroker) PublishDirect(ctx context.Context, msgs []*domain.Message) error {
+	b.subsMu.RLock()
+
+	deliveryMap := make(map[*Subscriber][]*domain.Message)
+	topicCounts := make(map[string]uint64)
+
+	for _, msg := range msgs {
+		if topicSubs, ok := b.subs[msg.Topic]; ok {
+			for _, sub := range topicSubs {
+				deliveryMap[sub] = append(deliveryMap[sub], msg)
+			}
+		}
+		topicCounts[msg.Topic]++
+	}
+
+	b.subsMu.RUnlock()
+
+	for sub, batch := range deliveryMap {
+		b.trackPendingBatch(sub.ID, batch)
+
+		for _, msg := range batch {
+			msgCopy := *msg
+
+			select {
+			case sub.Channel <- msgCopy:
+				// Success
+			case <-b.ctx.Done():
+				return b.ctx.Err()
+			case <-sub.quit:
+				continue
+			}
+		}
+	}
+
+	for topic, count := range topicCounts {
+		metrics.IncConsumedBatch(topic, count)
+	}
+
+	return nil
+}
+
+func (b *HybridBroker) trackPendingBatch(subID string, msgs []*domain.Message) {
+	shard := b.getAckShard(subID)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if _, ok := shard.pendingAcks[subID]; !ok {
+		shard.pendingAcks[subID] = make(map[string]*PendingMessage)
+	}
+
+	now := time.Now()
+	pendingMap := shard.pendingAcks[subID]
+
+	for _, msg := range msgs {
+		pendingMap[msg.ID] = &PendingMessage{
+			Msg:    *msg,
+			SentAt: now,
+		}
+	}
+}
 
 func (b *HybridBroker) Subscribe(ctx context.Context, topic string, groupID string) (<-chan domain.Message, string, error) {
 	b.subsMu.Lock()

@@ -19,9 +19,11 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	BrokerService_Publish_FullMethodName   = "/broker.BrokerService/Publish"
-	BrokerService_Subscribe_FullMethodName = "/broker.BrokerService/Subscribe"
-	BrokerService_Join_FullMethodName      = "/broker.BrokerService/Join"
+	BrokerService_Publish_FullMethodName       = "/broker.BrokerService/Publish"
+	BrokerService_PublishStream_FullMethodName = "/broker.BrokerService/PublishStream"
+	BrokerService_PublishBatch_FullMethodName  = "/broker.BrokerService/PublishBatch"
+	BrokerService_Subscribe_FullMethodName     = "/broker.BrokerService/Subscribe"
+	BrokerService_Join_FullMethodName          = "/broker.BrokerService/Join"
 )
 
 // BrokerServiceClient is the client API for BrokerService service.
@@ -30,6 +32,10 @@ const (
 type BrokerServiceClient interface {
 	// Publishing is "Fire and Forget" (Unary)
 	Publish(ctx context.Context, in *PublishRequest, opts ...grpc.CallOption) (*PublishResponse, error)
+	// O cliente abre um stream e manda milhares de msgs. O servidor responde só no final.
+	PublishStream(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PublishRequest, PublishSummary], error)
+	// Envia 1 requisição com 1000 mensagens dentro.
+	PublishBatch(ctx context.Context, in *PublishBatchRequest, opts ...grpc.CallOption) (*PublishResponse, error)
 	// Subscribing is a continuous flow of data (Server-Side Streaming).
 	Subscribe(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SubscribeRequest, Message], error)
 	// cluster management
@@ -54,9 +60,32 @@ func (c *brokerServiceClient) Publish(ctx context.Context, in *PublishRequest, o
 	return out, nil
 }
 
+func (c *brokerServiceClient) PublishStream(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PublishRequest, PublishSummary], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &BrokerService_ServiceDesc.Streams[0], BrokerService_PublishStream_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[PublishRequest, PublishSummary]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type BrokerService_PublishStreamClient = grpc.ClientStreamingClient[PublishRequest, PublishSummary]
+
+func (c *brokerServiceClient) PublishBatch(ctx context.Context, in *PublishBatchRequest, opts ...grpc.CallOption) (*PublishResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PublishResponse)
+	err := c.cc.Invoke(ctx, BrokerService_PublishBatch_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *brokerServiceClient) Subscribe(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SubscribeRequest, Message], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &BrokerService_ServiceDesc.Streams[0], BrokerService_Subscribe_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &BrokerService_ServiceDesc.Streams[1], BrokerService_Subscribe_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -83,6 +112,10 @@ func (c *brokerServiceClient) Join(ctx context.Context, in *JoinRequest, opts ..
 type BrokerServiceServer interface {
 	// Publishing is "Fire and Forget" (Unary)
 	Publish(context.Context, *PublishRequest) (*PublishResponse, error)
+	// O cliente abre um stream e manda milhares de msgs. O servidor responde só no final.
+	PublishStream(grpc.ClientStreamingServer[PublishRequest, PublishSummary]) error
+	// Envia 1 requisição com 1000 mensagens dentro.
+	PublishBatch(context.Context, *PublishBatchRequest) (*PublishResponse, error)
 	// Subscribing is a continuous flow of data (Server-Side Streaming).
 	Subscribe(grpc.BidiStreamingServer[SubscribeRequest, Message]) error
 	// cluster management
@@ -99,6 +132,12 @@ type UnimplementedBrokerServiceServer struct{}
 
 func (UnimplementedBrokerServiceServer) Publish(context.Context, *PublishRequest) (*PublishResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Publish not implemented")
+}
+func (UnimplementedBrokerServiceServer) PublishStream(grpc.ClientStreamingServer[PublishRequest, PublishSummary]) error {
+	return status.Errorf(codes.Unimplemented, "method PublishStream not implemented")
+}
+func (UnimplementedBrokerServiceServer) PublishBatch(context.Context, *PublishBatchRequest) (*PublishResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PublishBatch not implemented")
 }
 func (UnimplementedBrokerServiceServer) Subscribe(grpc.BidiStreamingServer[SubscribeRequest, Message]) error {
 	return status.Errorf(codes.Unimplemented, "method Subscribe not implemented")
@@ -145,6 +184,31 @@ func _BrokerService_Publish_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _BrokerService_PublishStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(BrokerServiceServer).PublishStream(&grpc.GenericServerStream[PublishRequest, PublishSummary]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type BrokerService_PublishStreamServer = grpc.ClientStreamingServer[PublishRequest, PublishSummary]
+
+func _BrokerService_PublishBatch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PublishBatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BrokerServiceServer).PublishBatch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BrokerService_PublishBatch_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BrokerServiceServer).PublishBatch(ctx, req.(*PublishBatchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _BrokerService_Subscribe_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(BrokerServiceServer).Subscribe(&grpc.GenericServerStream[SubscribeRequest, Message]{ServerStream: stream})
 }
@@ -182,11 +246,20 @@ var BrokerService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _BrokerService_Publish_Handler,
 		},
 		{
+			MethodName: "PublishBatch",
+			Handler:    _BrokerService_PublishBatch_Handler,
+		},
+		{
 			MethodName: "Join",
 			Handler:    _BrokerService_Join_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "PublishStream",
+			Handler:       _BrokerService_PublishStream_Handler,
+			ClientStreams: true,
+		},
 		{
 			StreamName:    "Subscribe",
 			Handler:       _BrokerService_Subscribe_Handler,

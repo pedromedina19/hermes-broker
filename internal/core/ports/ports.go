@@ -9,6 +9,7 @@ import (
 type BrokerEngine interface {
     Publish(ctx context.Context, msg domain.Message) error
     PublishBatch(ctx context.Context, msgs []*domain.Message) error
+    PublishDirect(ctx context.Context, msgs []*domain.Message) error
     Subscribe(ctx context.Context, topic string, groupID string) (<-chan domain.Message, string, error) 
     Acknowledge(subID string, msgID string)
     Unsubscribe(topic string, subID string)

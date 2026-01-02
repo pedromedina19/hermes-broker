@@ -5,8 +5,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,6 +45,8 @@ var (
 
 	currentScenario string
 	deliveryMode    pb.DeliveryMode
+
+	rateLimitPerWorker int
 )
 
 func recordError(err error) {
@@ -55,7 +59,8 @@ func recordError(err error) {
 	errMsg := err.Error()
 	if strings.Contains(errMsg, "context deadline exceeded") ||
 		strings.Contains(errMsg, "context canceled") ||
-		strings.Contains(errMsg, "canceled") {
+		strings.Contains(errMsg, "canceled") ||
+		strings.Contains(errMsg, "EOF") {
 		return
 	}
 	atomic.AddUint64(&totalErrs, 1)
@@ -64,31 +69,51 @@ func recordError(err error) {
 	errorMu.Unlock()
 }
 
+func throttle() {
+	if rateLimitPerWorker > 0 {
+		sleepTime := time.Second / time.Duration(rateLimitPerWorker)
+		time.Sleep(sleepTime)
+	}
+}
+
 func main() {
 	workers := flag.Int("workers", 60, "Total number of simultaneous workers")
 	duration := flag.Duration("duration", 15*time.Second, "Test duration")
 	scenario := flag.String("scenario", "live", "Cenários: live, disk, slow, late, crash, isolation")
-	protocol := flag.String("protocol", "all", "Protocolo: grpc, rest, graphql, all")
-	modeFlag := flag.String("mode", "consistent", "Modo de entrega: consistent (Raft), performance (Direct Disk)")
+	protocol := flag.String("protocol", "all", "Protocolo: grpc, grpc-stream, rest, graphql, all")
+	modeFlag := flag.String("mode", "consistent", "Modo de entrega: consistent (Raft), eventual (Disk Async), performance (Memory Async)")
+
+	flag.IntVar(&rateLimitPerWorker, "rate", 0, "Limite de mensagens por segundo POR worker (0 = ilimitado)")
 
 	flag.StringVar(&grpcTargetsStr, "grpc-targets", "localhost:50051,localhost:50052,localhost:50053", "List of gRPC nodes (csv)")
 	flag.StringVar(&httpTargetsStr, "http-targets", "localhost:8080,localhost:8081,localhost:8082", "HTTP Node List (csv)")
 	flag.StringVar(&subTarget, "sub-target", "localhost:50051", "Specific gRPC node for the Subscriber (Auditor)")
 
 	flag.Parse()
+
+	hostname, _ := os.Hostname()
+	if hostname != "" {
+		topic = fmt.Sprintf("bench-%s", hostname)
+	}
+
+	fmt.Printf("STARTING TEST: %s (Topic: %s)\n", strings.ToUpper(*scenario), topic)
+
 	currentScenario = *scenario
 
-	if strings.ToLower(*modeFlag) == "performance" {
+	switch strings.ToLower(*modeFlag) {
+	case "performance":
 		deliveryMode = pb.DeliveryMode_PERFORMANCE
-	} else {
+	case "eventual":
+		deliveryMode = pb.DeliveryMode_EVENTUAL
+	default:
 		deliveryMode = pb.DeliveryMode_CONSISTENT
 	}
 
 	grpcPool = strings.Split(grpcTargetsStr, ",")
 	httpPool = strings.Split(httpTargetsStr, ",")
 
-	fmt.Printf("STARTING TEST: %s \n", strings.ToUpper(*scenario))
-	fmt.Printf("Protocol: %s | Mode: %s | Workers: %d | Duration: %v\n", strings.ToUpper(*protocol), strings.ToUpper(*modeFlag), *workers, *duration)
+	fmt.Printf("Protocol: %s | Mode: %s | Workers: %d | Duration: %v | Rate: %d/s\n",
+		strings.ToUpper(*protocol), strings.ToUpper(*modeFlag), *workers, *duration, rateLimitPerWorker)
 	fmt.Printf("Publisher Pool: %v\n", grpcPool)
 	fmt.Printf("Subscriber Target: %s\n\n", subTarget)
 
@@ -157,21 +182,25 @@ func main() {
 
 	start := time.Now()
 
+	p := strings.ToLower(*protocol)
+
 	for i := 0; i < *workers; i++ {
 		wg.Add(1)
-		p := strings.ToLower(*protocol)
 		if p == "all" {
-			if i%3 == 0 {
+			switch i % 3 {
+			case 0:
 				go runGrpcWorker(pubCtx, &wg, i)
-			} else if i%3 == 1 {
+			case 1:
 				go runRestWorker(pubCtx, &wg, i)
-			} else {
+			case 2:
 				go runGraphqlWorker(pubCtx, &wg, i)
 			}
 		} else {
 			switch p {
 			case "grpc":
 				go runGrpcWorker(pubCtx, &wg, i)
+			case "grpc-stream":
+				go runGrpcStreamWorker(pubCtx, &wg, i)
 			case "rest":
 				go runRestWorker(pubCtx, &wg, i)
 			case "graphql":
@@ -261,9 +290,8 @@ drainLoop:
 	printReport(elapsed, *scenario)
 }
 
-
 func runInternalSubscriber(ctx context.Context, readyWg *sync.WaitGroup, topicName, groupID string, delay time.Duration, metric *uint64) {
-	ackChan := make(chan string, 200000)
+	ackChan := make(chan string, 1000000)
 
 	for {
 		select {
@@ -272,8 +300,7 @@ func runInternalSubscriber(ctx context.Context, readyWg *sync.WaitGroup, topicNa
 		default:
 		}
 
-		target := subTarget
-		conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(subTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			time.Sleep(500 * time.Millisecond)
 			continue
@@ -303,19 +330,20 @@ func runInternalSubscriber(ctx context.Context, readyWg *sync.WaitGroup, topicNa
 		}
 
 		ctxSub, cancelSub := context.WithCancel(ctx)
-		go func(c pb.BrokerService_SubscribeClient, cancelFunc context.CancelFunc) {
-			defer cancelFunc()
+
+		go func() {
+			defer cancelSub()
 			for {
 				select {
 				case <-ctxSub.Done():
 					return
 				case id := <-ackChan:
-					if sendErr := c.Send(&pb.SubscribeRequest{Action: "ACK", AckMessageId: id}); sendErr != nil {
+					if err := stream.Send(&pb.SubscribeRequest{Action: "ACK", AckMessageId: id}); err != nil {
 						return
 					}
 				}
 			}
-		}(stream, cancelSub)
+		}()
 
 		for {
 			msg, err := stream.Recv()
@@ -324,16 +352,18 @@ func runInternalSubscriber(ctx context.Context, readyWg *sync.WaitGroup, topicNa
 				cancelSub()
 				break
 			}
-			if delay > 0 {
-				time.Sleep(delay)
-			}
+
 			atomic.AddUint64(metric, 1)
+
 			select {
 			case ackChan <- msg.Id:
 			default:
 			}
+
+			if delay > 0 {
+				time.Sleep(delay)
+			}
 		}
-		time.Sleep(1 * time.Second)
 	}
 }
 
@@ -346,6 +376,7 @@ func getTopicForID(id int) string {
 	}
 	return topic
 }
+
 
 func runGrpcWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 	defer wg.Done()
@@ -381,6 +412,7 @@ func runGrpcWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 		case <-ctx.Done():
 			return
 		default:
+			throttle()
 			_, err := client.Publish(ctx, &pb.PublishRequest{
 				Topic:   targetTopic,
 				Payload: payload,
@@ -398,6 +430,82 @@ func runGrpcWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 				if targetTopic == "topic-B" {
 					atomic.AddUint64(&pubB, 1)
 				}
+			}
+		}
+	}
+}
+
+func runGrpcStreamWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
+	defer wg.Done()
+	targetIndex := id % len(grpcPool)
+
+	addr := grpcPool[targetIndex]
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Printf("Stream Worker %d connection failed: %v", id, err)
+		return
+	}
+	defer conn.Close()
+
+	client := pb.NewBrokerServiceClient(conn)
+	targetTopic := getTopicForID(id)
+	payload := []byte(fmt.Sprintf("Stream-%d", id))
+
+	var stream pb.BrokerService_PublishStreamClient
+
+	establishStream := func() error {
+		var err error
+		stream, err = client.PublishStream(context.Background())
+		return err
+	}
+
+	if err := establishStream(); err != nil {
+		log.Printf("Worker %d failed initial stream: %v", id, err)
+		return
+	}
+
+	req := &pb.PublishRequest{
+		Topic:   targetTopic,
+		Payload: payload,
+		Mode:    deliveryMode,
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			if stream != nil {
+				_, err := stream.CloseAndRecv()
+				if err != nil && err != io.EOF {
+				}
+			}
+			return
+		default:
+			if stream == nil {
+				if err := establishStream(); err != nil {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+			}
+
+			err := stream.Send(req)
+
+			if err == io.EOF {
+				stream = nil
+				continue
+			}
+			if err != nil {
+				recordError(err)
+				stream = nil
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+
+			atomic.AddUint64(&totalReqs, 1)
+			if targetTopic == "topic-A" {
+				atomic.AddUint64(&pubA, 1)
+			}
+			if targetTopic == "topic-B" {
+				atomic.AddUint64(&pubB, 1)
 			}
 		}
 	}
@@ -422,6 +530,7 @@ func runRestWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 		case <-ctx.Done():
 			return
 		default:
+			throttle()
 			buf.Reset()
 			buf.WriteString(jsonStr)
 			url := "http://" + httpPool[targetIndex] + "/publish"
@@ -467,6 +576,7 @@ func runGraphqlWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 		case <-ctx.Done():
 			return
 		default:
+			throttle()
 			buf.Reset()
 			buf.WriteString(query)
 			url := "http://" + httpPool[targetIndex] + "/query"

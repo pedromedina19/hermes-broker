@@ -56,7 +56,8 @@ type ComplexityRoot struct {
 	}
 
 	Mutation struct {
-		Publish func(childComplexity int, topic string, payload string, mode *model.DeliveryMode) int
+		Publish      func(childComplexity int, topic string, payload string, mode *model.DeliveryMode) int
+		PublishBatch func(childComplexity int, topic string, payloads []string, mode *model.DeliveryMode) int
 	}
 
 	PublishResponse struct {
@@ -74,6 +75,7 @@ type ComplexityRoot struct {
 
 type MutationResolver interface {
 	Publish(ctx context.Context, topic string, payload string, mode *model.DeliveryMode) (*model.PublishResponse, error)
+	PublishBatch(ctx context.Context, topic string, payloads []string, mode *model.DeliveryMode) (*model.PublishResponse, error)
 }
 type QueryResolver interface {
 	Health(ctx context.Context) (string, error)
@@ -137,6 +139,17 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.complexity.Mutation.Publish(childComplexity, args["topic"].(string), args["payload"].(string), args["mode"].(*model.DeliveryMode)), true
+	case "Mutation.publishBatch":
+		if e.complexity.Mutation.PublishBatch == nil {
+			break
+		}
+
+		args, err := ec.field_Mutation_publishBatch_args(ctx, rawArgs)
+		if err != nil {
+			return 0, false
+		}
+
+		return e.complexity.Mutation.PublishBatch(childComplexity, args["topic"].(string), args["payloads"].([]string), args["mode"].(*model.DeliveryMode)), true
 
 	case "PublishResponse.success":
 		if e.complexity.PublishResponse.Success == nil {
@@ -303,6 +316,27 @@ var parsedSchema = gqlparser.MustLoadSchema(sources...)
 // endregion ************************** generated!.gotpl **************************
 
 // region    ***************************** args.gotpl *****************************
+
+func (ec *executionContext) field_Mutation_publishBatch_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
+	var err error
+	args := map[string]any{}
+	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "topic", ec.unmarshalNString2string)
+	if err != nil {
+		return nil, err
+	}
+	args["topic"] = arg0
+	arg1, err := graphql.ProcessArgField(ctx, rawArgs, "payloads", ec.unmarshalNString2ᚕstringᚄ)
+	if err != nil {
+		return nil, err
+	}
+	args["payloads"] = arg1
+	arg2, err := graphql.ProcessArgField(ctx, rawArgs, "mode", ec.unmarshalODeliveryMode2ᚖgithubᚗcomᚋpedromedina19ᚋhermesᚑbrokerᚋgraphᚋmodelᚐDeliveryMode)
+	if err != nil {
+		return nil, err
+	}
+	args["mode"] = arg2
+	return args, nil
+}
 
 func (ec *executionContext) field_Mutation_publish_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
 	var err error
@@ -559,6 +593,51 @@ func (ec *executionContext) fieldContext_Mutation_publish(ctx context.Context, f
 	}()
 	ctx = graphql.WithFieldContext(ctx, fc)
 	if fc.Args, err = ec.field_Mutation_publish_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+		ec.Error(ctx, err)
+		return fc, err
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _Mutation_publishBatch(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		ec.fieldContext_Mutation_publishBatch,
+		func(ctx context.Context) (any, error) {
+			fc := graphql.GetFieldContext(ctx)
+			return ec.resolvers.Mutation().PublishBatch(ctx, fc.Args["topic"].(string), fc.Args["payloads"].([]string), fc.Args["mode"].(*model.DeliveryMode))
+		},
+		nil,
+		ec.marshalNPublishResponse2ᚖgithubᚗcomᚋpedromedina19ᚋhermesᚑbrokerᚋgraphᚋmodelᚐPublishResponse,
+		true,
+		true,
+	)
+}
+
+func (ec *executionContext) fieldContext_Mutation_publishBatch(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Mutation",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			switch field.Name {
+			case "success":
+				return ec.fieldContext_PublishResponse_success(ctx, field)
+			}
+			return nil, fmt.Errorf("no field named %q was found under type PublishResponse", field.Name)
+		},
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = ec.Recover(ctx, r)
+			ec.Error(ctx, err)
+		}
+	}()
+	ctx = graphql.WithFieldContext(ctx, fc)
+	if fc.Args, err = ec.field_Mutation_publishBatch_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
 		ec.Error(ctx, err)
 		return fc, err
 	}
@@ -2316,6 +2395,13 @@ func (ec *executionContext) _Mutation(ctx context.Context, sel ast.SelectionSet)
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}
+		case "publishBatch":
+			out.Values[i] = ec.OperationContext.RootResolverMiddleware(innerCtx, func(ctx context.Context) (res graphql.Marshaler) {
+				return ec._Mutation_publishBatch(ctx, field)
+			})
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -2895,6 +2981,36 @@ func (ec *executionContext) marshalNString2string(ctx context.Context, sel ast.S
 		}
 	}
 	return res
+}
+
+func (ec *executionContext) unmarshalNString2ᚕstringᚄ(ctx context.Context, v any) ([]string, error) {
+	var vSlice []any
+	vSlice = graphql.CoerceList(v)
+	var err error
+	res := make([]string, len(vSlice))
+	for i := range vSlice {
+		ctx := graphql.WithPathContext(ctx, graphql.NewPathWithIndex(i))
+		res[i], err = ec.unmarshalNString2string(ctx, vSlice[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return res, nil
+}
+
+func (ec *executionContext) marshalNString2ᚕstringᚄ(ctx context.Context, sel ast.SelectionSet, v []string) graphql.Marshaler {
+	ret := make(graphql.Array, len(v))
+	for i := range v {
+		ret[i] = ec.marshalNString2string(ctx, sel, v[i])
+	}
+
+	for _, e := range ret {
+		if e == graphql.Null {
+			return graphql.Null
+		}
+	}
+
+	return ret
 }
 
 func (ec *executionContext) marshalN__Directive2githubᚗcomᚋ99designsᚋgqlgenᚋgraphqlᚋintrospectionᚐDirective(ctx context.Context, sel ast.SelectionSet, v introspection.Directive) graphql.Marshaler {

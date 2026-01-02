@@ -19,6 +19,12 @@ type JoinRequest struct {
 	NodeID   string `json:"node_id"`
 	RaftAddr string `json:"raft_addr"`
 }
+
+type PublishBatchRequest struct {
+	Topic    string   `json:"topic"`
+	Payloads []string `json:"payloads"`
+	Mode     int      `json:"mode"`
+}
 func NewRestHandler(service *services.BrokerService, cfg config.Config) *RestHandler {
 	return &RestHandler{
 		service: service,
@@ -149,4 +155,42 @@ func (h *RestHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(res)
+}
+
+func (h *RestHandler) HandlePublishBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req PublishBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.Topic == "" || len(req.Payloads) == 0 {
+		http.Error(w, "Topic and payloads are required", http.StatusBadRequest)
+		return
+	}
+
+	deliveryMode := pb.DeliveryMode(req.Mode)
+
+	payloads := make([][]byte, len(req.Payloads))
+	for i, p := range req.Payloads {
+		payloads[i] = []byte(p)
+	}
+
+	err := h.service.PublishBatchList(r.Context(), req.Topic, payloads, deliveryMode)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true, 
+		"count": len(payloads),
+	})
 }

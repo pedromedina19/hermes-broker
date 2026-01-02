@@ -34,6 +34,7 @@ type BrokerService struct {
 
 	batchChan       chan *domain.Message
 	fastBatchChan   chan *domain.Message
+	memBatchChan    chan *domain.Message
 	replicationChan chan []domain.Message
 	pending         map[string]chan publishResult
 	mu              sync.RWMutex
@@ -56,6 +57,7 @@ func NewBrokerService(engine ports.BrokerEngine, consensus ConsensusNode, nodeID
 		consensus:       consensus,
 		batchChan:       make(chan *domain.Message, 20000),
 		fastBatchChan:   make(chan *domain.Message, 50000),
+		memBatchChan:    make(chan *domain.Message, 100000),
 		replicationChan: make(chan []domain.Message, 10000),
 		pending:         make(map[string]chan publishResult),
 		proxyStreams:    make(map[string]pb.BrokerService_SubscribeClient),
@@ -88,6 +90,7 @@ func NewBrokerService(engine ports.BrokerEngine, consensus ConsensusNode, nodeID
 
 	go s.runBatcher()
 	go s.runFastBatcher()
+	go s.runMemoryBatcher()
 	go s.runAsyncReplicator()
 	return s
 }
@@ -115,45 +118,47 @@ func (s *BrokerService) Publish(ctx context.Context, topic string, payload []byt
 	msg.Payload = append(msg.Payload, payload...)
 	msg.Timestamp = time.Now()
 
-	if mode == pb.DeliveryMode_PERFORMANCE {
+	switch mode {
+	case pb.DeliveryMode_PERFORMANCE:
+		s.memBatchChan <- msg
+		return nil
+
+	case pb.DeliveryMode_EVENTUAL:
+		s.fastBatchChan <- msg
+		return nil
+
+	default: // CONSISTENT (0)
+		resChan := make(chan publishResult, 1)
+		s.mu.Lock()
+		s.pending[msg.ID] = resChan
+		s.mu.Unlock()
+
 		select {
-		case s.fastBatchChan <- msg:
-			return nil
-		default:
+		case s.batchChan <- msg:
+		case <-ctx.Done():
 			metrics.IncFailed()
+			s.cleanupPending(msg.ID)
 			s.messagePool.Put(msg)
-			return fmt.Errorf("performance buffer full")
+			return ctx.Err()
+		}
+
+		select {
+		case res := <-resChan:
+			s.messagePool.Put(msg)
+			return res.err
+		case <-ctx.Done():
+			s.cleanupPending(msg.ID)
+			s.messagePool.Put(msg)
+			return ctx.Err()
 		}
 	}
+}
 
-	resChan := make(chan publishResult, 1)
-
-	s.mu.Lock()
-	s.pending[msg.ID] = resChan
-	s.mu.Unlock()
-
-	if len(s.batchChan) > 15000 {
-		slog.Warn("Hermes Batch Channel High Load", "size", len(s.batchChan))
+func (s *BrokerService) PublishBatchList(ctx context.Context, topic string, payloads [][]byte, mode pb.DeliveryMode) error {
+	for _, payload := range payloads {
+		_ = s.Publish(ctx, topic, payload, mode)
 	}
-
-	select {
-	case s.batchChan <- msg:
-	case <-ctx.Done():
-		metrics.IncFailed()
-		s.cleanupPending(msg.ID)
-		s.messagePool.Put(msg)
-		return ctx.Err()
-	}
-
-	select {
-	case res := <-resChan:
-		s.messagePool.Put(msg)
-		return res.err
-	case <-ctx.Done():
-		s.cleanupPending(msg.ID)
-		s.messagePool.Put(msg)
-		return ctx.Err()
-	}
+	return nil
 }
 
 func (s *BrokerService) Subscribe(ctx context.Context, topic string, groupID string) (<-chan domain.Message, string, error) {
@@ -245,7 +250,6 @@ func (s *BrokerService) runFastBatcher() {
 		msgCopy.Payload = append([]byte(nil), msgPtr.Payload...)
 		batch = append(batch, msgCopy)
 
-
 		timeout := time.After(lingerTime)
 		full := false
 
@@ -278,7 +282,6 @@ func (s *BrokerService) runFastBatcher() {
 				}
 			}
 
-			
 			select {
 			case s.replicationChan <- batch:
 			default:
@@ -287,6 +290,60 @@ func (s *BrokerService) runFastBatcher() {
 
 			for _, m := range originalPtrs {
 				s.messagePool.Put(m)
+			}
+		}
+	}
+}
+
+func (s *BrokerService) runMemoryBatcher() {
+	const maxBatchSize = 20000
+	const lingerTime = 200 * time.Millisecond
+
+	for {
+		batch := make([]domain.Message, 0, maxBatchSize)
+
+		msgPtr, ok := <-s.memBatchChan
+		if !ok {
+			return
+		}
+
+		msgCopy := *msgPtr
+		msgCopy.Payload = append([]byte(nil), msgPtr.Payload...)
+		batch = append(batch, msgCopy)
+
+		s.messagePool.Put(msgPtr)
+
+		timeout := time.After(lingerTime)
+		full := false
+		for !full && len(batch) < maxBatchSize {
+			select {
+			case m := <-s.memBatchChan:
+				mCopy := *m
+				mCopy.Payload = append([]byte(nil), m.Payload...)
+				batch = append(batch, mCopy)
+				s.messagePool.Put(m)
+			case <-timeout:
+				full = true
+			}
+		}
+
+		if len(batch) > 0 {
+			batchPtrs := make([]*domain.Message, len(batch))
+			for i := range batch {
+				batchPtrs[i] = &batch[i]
+			}
+
+			if err := s.engine.PublishDirect(context.Background(), batchPtrs); err != nil {
+				slog.Error("Memory delivery failed", "err", err)
+			}
+
+			topicCounts := make(map[string]uint64)
+			for _, m := range batch {
+				topicCounts[m.Topic]++
+			}
+
+			for topic, count := range topicCounts {
+				metrics.IncPublishedBatch(topic, count)
 			}
 		}
 	}
