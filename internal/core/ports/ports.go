@@ -13,6 +13,8 @@ type BrokerEngine interface {
     Acknowledge(subID string, msgID string)
     Unsubscribe(topic string, subID string)
     Close()
+    SyncOffset(topic, groupID string, offset uint64) error
+	SetReplicationCallback(fn func(topic, groupID string, offset uint64))
 }
 //defines how to persist messages
 type MessageRepository interface {

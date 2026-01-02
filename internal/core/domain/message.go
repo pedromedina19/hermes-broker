@@ -2,6 +2,25 @@ package domain
 
 import "time"
 
+
+const (
+	LogTypePublish = "PUBLISH"
+	LogTypeOffset  = "OFFSET"
+	LogTypeReplica = "REPLICA"
+)
+
+type RaftCommand struct {
+	Type         string    `json:"type"`
+	OriginNodeID string    `json:"origin_node_id,omitempty"`
+	Messages     []Message `json:"messages,omitempty"`
+	OffsetCommit *Offset   `json:"offset,omitempty"`
+}
+
+type Offset struct {
+	Topic   string `json:"topic"`
+	GroupID string `json:"group_id"`
+	Value   uint64 `json:"value"`
+}
 type Message struct {
 	ID        string
 	Topic     string

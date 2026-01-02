@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	bolt "go.etcd.io/bbolt"
 )
 
 const (
@@ -36,9 +37,11 @@ func NewRaftNode(conf RaftConfig, fsm *BrokerFSM, logger *slog.Logger) (*RaftNod
 	config := raft.DefaultConfig()
 	config.LocalID = raft.ServerID(conf.NodeID)
 
+	config.BatchApplyCh = true
+
 	raftLogger := hclog.New(&hclog.LoggerOptions{
 		Name:   "raft",
-		Level:  hclog.Info,
+		Level:  hclog.Warn,
 		Output: os.Stderr,
 	})
 	config.Logger = raftLogger
@@ -77,7 +80,15 @@ func NewRaftNode(conf RaftConfig, fsm *BrokerFSM, logger *slog.Logger) (*RaftNod
 
 	// BoltDB (Log Store)
 	boltFile := filepath.Join(conf.DataDir, "raft.db")
-	logStore, err := raftboltdb.NewBoltStore(boltFile)
+
+	logStore, err := raftboltdb.New(raftboltdb.Options{
+		Path: boltFile,
+		BoltOptions: &bolt.Options{
+			NoSync:  true,
+			Timeout: 1 * time.Second,
+		},
+	})
+
 	if err != nil {
 		return nil, fmt.Errorf("new bolt store: %w", err)
 	}

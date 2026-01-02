@@ -32,25 +32,34 @@ type BrokerService struct {
 	engine    ports.BrokerEngine
 	consensus ConsensusNode
 
-	batchChan     chan *domain.Message
-	fastBatchChan chan *domain.Message
-	pending       map[string]chan publishResult
-	mu            sync.RWMutex
+	batchChan       chan *domain.Message
+	fastBatchChan   chan *domain.Message
+	replicationChan chan []domain.Message
+	pending         map[string]chan publishResult
+	mu              sync.RWMutex
 
 	messagePool sync.Pool
 
 	proxyMu      sync.RWMutex
 	proxyStreams map[string]pb.BrokerService_SubscribeClient
+
+	leaderConn   *grpc.ClientConn
+	leaderTarget string
+	leaderMu     sync.RWMutex
+
+	nodeID string
 }
 
-func NewBrokerService(engine ports.BrokerEngine, consensus ConsensusNode) *BrokerService {
+func NewBrokerService(engine ports.BrokerEngine, consensus ConsensusNode, nodeID string) *BrokerService {
 	s := &BrokerService{
-		engine:        engine,
-		consensus:     consensus,
-		batchChan:     make(chan *domain.Message, 20000),
-		fastBatchChan: make(chan *domain.Message, 20000),
-		pending:       make(map[string]chan publishResult),
-		proxyStreams:  make(map[string]pb.BrokerService_SubscribeClient),
+		engine:          engine,
+		consensus:       consensus,
+		batchChan:       make(chan *domain.Message, 20000),
+		fastBatchChan:   make(chan *domain.Message, 50000),
+		replicationChan: make(chan []domain.Message, 10000),
+		pending:         make(map[string]chan publishResult),
+		proxyStreams:    make(map[string]pb.BrokerService_SubscribeClient),
+		nodeID:          nodeID,
 		messagePool: sync.Pool{
 			New: func() interface{} {
 				return &domain.Message{
@@ -60,8 +69,26 @@ func NewBrokerService(engine ports.BrokerEngine, consensus ConsensusNode) *Broke
 		},
 	}
 
+	engine.SetReplicationCallback(func(topic, groupID string, offset uint64) {
+		cmd := domain.RaftCommand{
+			Type: domain.LogTypeOffset,
+			OffsetCommit: &domain.Offset{
+				Topic:   topic,
+				GroupID: groupID,
+				Value:   offset,
+			},
+		}
+		if consensus.IsLeader() {
+			err := consensus.ApplyMessage(cmd)
+			if err != nil {
+				slog.Error("Failed to apply offset to Raft", "error", err)
+			}
+		}
+	})
+
 	go s.runBatcher()
 	go s.runFastBatcher()
+	go s.runAsyncReplicator()
 	return s
 }
 
@@ -75,6 +102,7 @@ func (s *BrokerService) Publish(ctx context.Context, topic string, payload []byt
 		err = s.proxyPublishToLeader(ctx, leaderTarget, topic, payload, mode)
 		if err != nil {
 			metrics.IncFailed()
+			s.resetLeaderConn()
 			slog.Error("Proxy Publish Failed", "target", leaderTarget, "error", err)
 		}
 		return err
@@ -155,16 +183,16 @@ func (s *BrokerService) Acknowledge(subID, msgID string) {
 }
 
 func (s *BrokerService) runBatcher() {
-	const maxBatchSize = 500
+	const maxBatchSize = 5000
 	const lingerTime = 5 * time.Millisecond
 
 	for {
-		batch := make([]*domain.Message, 0, maxBatchSize)
-		msg, ok := <-s.batchChan
+		batch := make([]domain.Message, 0, maxBatchSize)
+		msgPtr, ok := <-s.batchChan
 		if !ok {
 			return
 		}
-		batch = append(batch, msg)
+		batch = append(batch, *msgPtr)
 
 		timeout := time.After(lingerTime)
 		full := false
@@ -172,21 +200,21 @@ func (s *BrokerService) runBatcher() {
 		for !full && len(batch) < maxBatchSize {
 			select {
 			case m := <-s.batchChan:
-				batch = append(batch, m)
+				batch = append(batch, *m)
 			case <-timeout:
 				full = true
 			}
 		}
 
-		raftPayload := make([]domain.Message, len(batch))
-		for i, m := range batch {
-			raftPayload[i] = *m
+		cmd := domain.RaftCommand{
+			Type:     domain.LogTypePublish,
+			Messages: batch,
 		}
 
 		start := time.Now()
-		err := s.consensus.ApplyMessage(raftPayload)
+		err := s.consensus.ApplyMessage(cmd)
 		duration := time.Since(start)
-		if duration > 500*time.Millisecond {
+		if duration > 1*time.Second {
 			slog.Warn("Slow Raft Apply", "duration", duration, "batch_size", len(batch))
 		}
 
@@ -202,61 +230,144 @@ func (s *BrokerService) runBatcher() {
 }
 
 func (s *BrokerService) runFastBatcher() {
-	const maxBatchSize = 2000
-	const lingerTime = 10 * time.Millisecond
-
-	batch := make([]*domain.Message, 0, maxBatchSize)
+	const maxBatchSize = 20000
+	const lingerTime = 200 * time.Millisecond
 
 	for {
-		msg := <-s.fastBatchChan
-		batch = append(batch, msg)
+		batch := make([]domain.Message, 0, maxBatchSize)
+
+		msgPtr, ok := <-s.fastBatchChan
+		if !ok {
+			return
+		}
+
+		msgCopy := *msgPtr
+		msgCopy.Payload = append([]byte(nil), msgPtr.Payload...)
+		batch = append(batch, msgCopy)
+
 
 		timeout := time.After(lingerTime)
 		full := false
+
+		originalPtrs := []*domain.Message{msgPtr}
+
 		for !full && len(batch) < maxBatchSize {
 			select {
 			case m := <-s.fastBatchChan:
-				batch = append(batch, m)
+				mCopy := *m
+				mCopy.Payload = append([]byte(nil), m.Payload...)
+				batch = append(batch, mCopy)
+
+				originalPtrs = append(originalPtrs, m)
 			case <-timeout:
 				full = true
 			}
 		}
 
 		if len(batch) > 0 {
-			if err := s.engine.PublishBatch(context.Background(), batch); err != nil {
-				slog.Error("FastBatcher failed", "err", err)
-			} else {
-				for _, m := range batch {
-                     metrics.IncPublished(m.Topic, 1)
-                 }
+			batchPtrs := make([]*domain.Message, len(batch))
+			for i := range batch {
+				batchPtrs[i] = &batch[i]
 			}
 
-			for _, m := range batch {
+			if err := s.engine.PublishBatch(context.Background(), batchPtrs); err != nil {
+				slog.Error("FastBatcher failed local write", "err", err)
+			} else {
+				for _, m := range batch {
+					metrics.IncPublished(m.Topic, 1)
+				}
+			}
+
+			
+			select {
+			case s.replicationChan <- batch:
+			default:
+				slog.Warn("Replication channel full, skipping replication for batch", "size", len(batch))
+			}
+
+			for _, m := range originalPtrs {
 				s.messagePool.Put(m)
 			}
-			batch = batch[:0]
+		}
+	}
+}
+
+func (s *BrokerService) runAsyncReplicator() {
+	const maxRaftBatch = 5000
+
+	for {
+		batch := <-s.replicationChan
+
+	drainLoop:
+		for len(batch) < maxRaftBatch {
+			select {
+			case more := <-s.replicationChan:
+				batch = append(batch, more...)
+			default:
+				break drainLoop
+			}
+		}
+
+		cmd := domain.RaftCommand{
+			Type:         domain.LogTypeReplica,
+			OriginNodeID: s.nodeID,
+			Messages:     batch,
+		}
+
+		if err := s.consensus.ApplyMessage(cmd); err != nil {
+			slog.Error("Async replication failed", "err", err)
 		}
 	}
 }
 
 func (s *BrokerService) getLeaderTarget() (string, error) {
-    leaderID := s.consensus.GetLeaderAddr()
-    if leaderID == "" {
-        return "", fmt.Errorf("no leader")
-    }
-    host := strings.Replace(leaderID, "node-", "hermes-", 1)
-    if !strings.Contains(host, "hermes-internal") {
-        host = fmt.Sprintf("%s.hermes-internal", host)
-    }
-    return fmt.Sprintf("%s:50051", host), nil
+	leaderID := s.consensus.GetLeaderAddr()
+	if leaderID == "" {
+		return "", fmt.Errorf("no leader")
+	}
+	host := strings.Replace(leaderID, "node-", "hermes-", 1)
+	if !strings.Contains(host, "hermes-internal") {
+		host = fmt.Sprintf("%s.hermes-internal", host)
+	}
+	return fmt.Sprintf("%s:50051", host), nil
+}
+
+func (s *BrokerService) getLeaderConn(addr string) (*grpc.ClientConn, error) {
+	s.leaderMu.Lock()
+	defer s.leaderMu.Unlock()
+
+	if s.leaderConn != nil && s.leaderTarget == addr {
+		return s.leaderConn, nil
+	}
+
+	if s.leaderConn != nil {
+		s.leaderConn.Close()
+	}
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+
+	s.leaderConn = conn
+	s.leaderTarget = addr
+	return conn, nil
+}
+
+func (s *BrokerService) resetLeaderConn() {
+	s.leaderMu.Lock()
+	defer s.leaderMu.Unlock()
+	if s.leaderConn != nil {
+		s.leaderConn.Close()
+		s.leaderConn = nil
+	}
 }
 
 func (s *BrokerService) proxyPublishToLeader(ctx context.Context, addr, topic string, payload []byte, mode pb.DeliveryMode) error {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := s.getLeaderConn(addr)
 	if err != nil {
 		return fmt.Errorf("proxy connect failed to %s: %w", addr, err)
 	}
-	defer conn.Close()
 
 	client := pb.NewBrokerServiceClient(conn)
 	_, err = client.Publish(ctx, &pb.PublishRequest{
@@ -302,11 +413,14 @@ func (s *BrokerService) proxySubscribeToLeader(ctx context.Context, topic, group
 	s.proxyStreams[proxySubID] = stream
 	s.proxyMu.Unlock()
 
+	metrics.UpdateSubscribers(topic, 1)
+
 	go func() {
 		defer func() {
 			conn.Close()
 			close(msgChan)
 			s.RemoveSubscriber(topic, proxySubID)
+			metrics.UpdateSubscribers(topic, -1)
 		}()
 
 		for {

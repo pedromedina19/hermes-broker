@@ -46,7 +46,7 @@ func main() {
 	os.MkdirAll(brokerDataDir, 0755)
 
 	brokerEngine := memory.NewHybridBroker(brokerDataDir, cfg.BufferSize, logger)
-	fsm := consensus.NewBrokerFSM(brokerEngine, logger)
+	fsm := consensus.NewBrokerFSM(brokerEngine, cfg.NodeID, logger)
 
 	raftNode, err := consensus.NewRaftNode(raftConf, fsm, logger)
 	if err != nil {
@@ -54,7 +54,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	brokerService := services.NewBrokerService(brokerEngine, raftNode)
+	brokerService := services.NewBrokerService(brokerEngine, raftNode, cfg.NodeID)
 
 	if cfg.JoinAddr != "" && !cfg.Bootstrap && !raftNode.HasState() {
 		go autoJoin(cfg, logger)

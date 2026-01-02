@@ -16,35 +16,75 @@ import (
 type BrokerFSM struct {
 	engine ports.BrokerEngine
 	logger *slog.Logger
+	nodeID string
 }
 
-func NewBrokerFSM(engine ports.BrokerEngine, logger *slog.Logger) *BrokerFSM {
+func NewBrokerFSM(engine ports.BrokerEngine, nodeID string, logger *slog.Logger) *BrokerFSM {
 	return &BrokerFSM{
 		engine: engine,
+		nodeID: nodeID,
 		logger: logger,
 	}
 }
 
 // Apply is called by Raft when a log is committed
 func (fsm *BrokerFSM) Apply(l *raft.Log) interface{} {
-	var messages []domain.Message
-	if err := json.Unmarshal(l.Data, &messages); err != nil {
-		var msg domain.Message
-		if err := json.Unmarshal(l.Data, &msg); err != nil {
-			fsm.logger.Error("FSM: Failed to unmarshal", "error", err)
-			return err
+	var cmd domain.RaftCommand
+
+	if err := json.Unmarshal(l.Data, &cmd); err != nil {
+		var messages []domain.Message
+		if errLegacy := json.Unmarshal(l.Data, &messages); errLegacy == nil {
+			fsm.applyPublish(messages)
+			return nil
 		}
-		messages = append(messages, msg)
+		fsm.logger.Error("FSM: Failed to unmarshal", "error", err)
+		return err
 	}
 
-	for _, msg := range messages {
-		if err := fsm.engine.Publish(context.TODO(), msg); err != nil {
-			fsm.logger.Error("FSM: Failed to publish to engine", "id", msg.ID, "error", err)
+	switch cmd.Type {
+	case domain.LogTypePublish:
+		fsm.applyPublish(cmd.Messages)
+	case domain.LogTypeOffset:
+		if cmd.OffsetCommit != nil {
+			fsm.applyOffset(*cmd.OffsetCommit)
 		}
-		metrics.IncPublished(msg.Topic, 1)
+	case domain.LogTypeReplica:
+		if cmd.OriginNodeID == fsm.nodeID {
+			fsm.logger.Error("IGNORING SELF REPLICA - WORKING CORRECTLY")
+			return nil
+		}
+		fsm.applyPublish(cmd.Messages)
+
+	default:
+		if cmd.Type == "" && len(cmd.Messages) > 0 {
+			fsm.applyPublish(cmd.Messages)
+		} else {
+			fsm.logger.Warn("Unknown Raft Command Type", "type", cmd.Type)
+		}
 	}
 
 	return nil
+}
+
+func (fsm *BrokerFSM) applyPublish(messages []domain.Message) {
+	batchPtrs := make([]*domain.Message, len(messages))
+	for i := range messages {
+		batchPtrs[i] = &messages[i]
+	}
+
+	if err := fsm.engine.PublishBatch(context.TODO(), batchPtrs); err != nil {
+		fsm.logger.Error("FSM: Failed to publish batch to engine", "count", len(messages), "error", err)
+	}
+
+	for _, msg := range messages {
+		metrics.IncPublished(msg.Topic, 1)
+	}
+}
+
+func (fsm *BrokerFSM) applyOffset(off domain.Offset) {
+	if err := fsm.engine.SyncOffset(off.Topic, off.GroupID, off.Value); err != nil {
+		fsm.logger.Error("FSM: Failed to sync offset", "group", off.GroupID, "error", err)
+	}
 }
 
 func (fsm *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
@@ -52,10 +92,6 @@ func (fsm *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 }
 
 func (fsm *BrokerFSM) Restore(rc io.ReadCloser) error {
-	// In a real-world scenario, we would read the binary from the database and replace the local file
-	// This requires closing the current database, replacing the file, and reopening it
-	// It's a complex "Hot Swap" operation
-	// For the benchmark, just drain the Reader to avoid crashing Raft
 	defer rc.Close()
 	io.Copy(io.Discard, rc)
 	return nil

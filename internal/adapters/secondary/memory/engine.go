@@ -55,6 +55,7 @@ type HybridBroker struct {
 	logger    ports.Logger
 	ctx       context.Context
 	cancel    context.CancelFunc
+	replicationFunc func(topic, groupID string, offset uint64)
 }
 
 func NewHybridBroker(dataDir string, bufferSize int, logger ports.Logger) *HybridBroker {
@@ -85,6 +86,14 @@ func NewHybridBroker(dataDir string, bufferSize int, logger ports.Logger) *Hybri
 	go broker.redeliveryLoop()
 
 	return broker
+}
+
+func (b *HybridBroker) SetReplicationCallback(fn func(topic, groupID string, offset uint64)) {
+	b.replicationFunc = fn
+}
+
+func (b *HybridBroker) SyncOffset(topic, groupID string, offset uint64) error {
+	return b.store.SaveOffset(topic, groupID, offset)
 }
 
 func (b *HybridBroker) getAckShard(subID string) *AckShard {
@@ -216,9 +225,13 @@ func (b *HybridBroker) runOffsetCommitter(sub *Subscriber, topic string) {
 			acked := atomic.LoadUint64(&sub.AckedCount)
 			if acked > 0 {
 				newOffset := sub.StartOffset + acked - 1
-				err := b.store.SaveOffset(topic, sub.GroupID, newOffset)
-				if err != nil {
-					b.logger.Error("Failed to save offset", "err", err)
+				if b.replicationFunc != nil {
+					b.replicationFunc(topic, sub.GroupID, newOffset)
+				} else {
+					err := b.store.SaveOffset(topic, sub.GroupID, newOffset)
+					if err != nil {
+						b.logger.Error("Failed to save offset locally", "err", err)
+					}
 				}
 			}
 		}
