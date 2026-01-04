@@ -9,7 +9,11 @@ import (
 	"github.com/pedromedina19/hermes-broker/internal/core/domain"
 	bolt "go.etcd.io/bbolt"
 )
-
+const (
+	OffsetsBucket = "consumer_offsets"
+	MetaBucket    = "_meta"            
+	RaftIndexKey  = "last_raft_index" 
+)
 type BoltLogStore struct {
     db *bolt.DB
     mu sync.RWMutex
@@ -24,6 +28,10 @@ func NewBoltLogStore(path string) (*BoltLogStore, error) {
     if err != nil {
         return nil, err
     }
+    err = db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte(MetaBucket))
+		return err
+	})
     return &BoltLogStore{db: db}, nil
 }
 
@@ -33,37 +41,65 @@ func itob(v uint64) []byte {
     return b
 }
 
-func (s *BoltLogStore) Append(msg domain.Message) (uint64, error) {
-    var id uint64
-    err := s.db.Update(func(tx *bolt.Tx) error {
-        b, err := tx.CreateBucketIfNotExists([]byte(msg.Topic))
-        if err != nil { return err }
-        id, _ = b.NextSequence()
-        data, err := json.Marshal(msg)
-        if err != nil { return err }
-        return b.Put(itob(id), data)
-    })
-    return id, err
+func (s *BoltLogStore) GetLastRaftIndex() (uint64, error) {
+	var index uint64 = 0
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(MetaBucket))
+		if b == nil {
+			return nil
+		}
+		val := b.Get([]byte(RaftIndexKey))
+		if val != nil {
+			index = binary.BigEndian.Uint64(val)
+		}
+		return nil
+	})
+	return index, err
 }
 
-func (s *BoltLogStore) AppendBatch(msgs []*domain.Message) error {
-    return s.db.Update(func(tx *bolt.Tx) error {
-        for _, msg := range msgs {
-            b, err := tx.CreateBucketIfNotExists([]byte(msg.Topic))
-            if err != nil {
-                return err
-            }
-            id, _ := b.NextSequence()
-            data, err := json.Marshal(msg)
-            if err != nil {
-                return err
-            }
-            if err := b.Put(itob(id), data); err != nil {
-                return err
-            }
-        }
-        return nil
-    })
+func (s *BoltLogStore) AppendBatch(msgs []*domain.Message, raftIndex uint64) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		for _, msg := range msgs {
+			b, err := tx.CreateBucketIfNotExists([]byte(msg.Topic))
+			if err != nil {
+				return err
+			}
+			id, _ := b.NextSequence()
+			data, err := json.Marshal(msg)
+			if err != nil {
+				return err
+			}
+			if err := b.Put(itob(id), data); err != nil {
+				return err
+			}
+		}
+
+		if raftIndex > 0 {
+			meta := tx.Bucket([]byte(MetaBucket))
+			if err := meta.Put([]byte(RaftIndexKey), itob(raftIndex)); err != nil {
+				return err
+			}
+		}
+		
+		return nil
+	})
+}
+
+func (s *BoltLogStore) Append(msg domain.Message) (uint64, error) {
+	var id uint64
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte(msg.Topic))
+		if err != nil {
+			return err
+		}
+		id, _ = b.NextSequence()
+		data, err := json.Marshal(msg)
+		if err != nil {
+			return err
+		}
+		return b.Put(itob(id), data)
+	})
+	return id, err
 }
 
 func (s *BoltLogStore) ReadBatch(topic string, startOffset uint64, limit int) ([]domain.Message, uint64, error) {
@@ -98,8 +134,6 @@ func (s *BoltLogStore) ReadBatch(topic string, startOffset uint64, limit int) ([
         return nil, startOffset, err
     }
 
-    // SLOW PHASE (CPU BOUND): We do this WITHOUT holding db
-    // Raft can write freely while we do this here
     var msgs []domain.Message
     for _, data := range rawMessages {
         var msg domain.Message
@@ -126,19 +160,24 @@ func (s *BoltLogStore) Close() error {
     return s.db.Close()
 }
 
-const OffsetsBucket = "consumer_offsets"
-
 // key: "topic:groupID" -> value: offset (uint64)
-func (s *BoltLogStore) SaveOffset(topic, groupID string, offset uint64) error {
-    //log.Printf("Saving Offset topic=%s group=%s offset=%d", topic, groupID, offset)
-    return s.db.Update(func(tx *bolt.Tx) error {
-        b, err := tx.CreateBucketIfNotExists([]byte(OffsetsBucket))
-        if err != nil {
-            return err
-        }
-        key := []byte(topic + ":" + groupID)
-        return b.Put(key, itob(offset))
-    })
+func (s *BoltLogStore) SaveOffset(topic, groupID string, offset uint64, raftIndex uint64) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte(OffsetsBucket))
+		if err != nil {
+			return err
+		}
+		key := []byte(topic + ":" + groupID)
+		if err := b.Put(key, itob(offset)); err != nil {
+			return err
+		}
+
+		if raftIndex > 0 {
+			meta := tx.Bucket([]byte(MetaBucket))
+			return meta.Put([]byte(RaftIndexKey), itob(raftIndex))
+		}
+		return nil
+	})
 }
 
 // GetOffset: Pick up where the customer left off

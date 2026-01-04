@@ -162,6 +162,16 @@ go run cmd/benchmark/main.go \
   -grpc-targets='hermes-0.hermes-internal:50051' \
   -sub-target='hermes-0.hermes-internal:50051'"
 
+kubectl exec -it bench-runner -- bash -c "cd /app && \
+go run cmd/benchmark/main.go \
+  -scenario=live \
+  -workers=1 \
+  -duration=3800s \
+  -mode=eventual \
+  -rate=10000 \
+  -protocol=grpc-stream \
+  -grpc-targets='hermes-0.hermes-internal:50051' \
+  -sub-target='hermes-0.hermes-internal:50051'"
 
 
 

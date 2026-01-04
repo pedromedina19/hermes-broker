@@ -93,7 +93,7 @@ func (b *HybridBroker) SetReplicationCallback(fn func(topic, groupID string, off
 }
 
 func (b *HybridBroker) SyncOffset(topic, groupID string, offset uint64) error {
-	return b.store.SaveOffset(topic, groupID, offset)
+	return b.store.SaveOffset(topic, groupID, offset, 0)
 }
 
 func (b *HybridBroker) getAckShard(subID string) *AckShard {
@@ -111,13 +111,17 @@ func (b *HybridBroker) Publish(ctx context.Context, msg domain.Message) error {
 	return err
 }
 
-func (b *HybridBroker) PublishBatch(ctx context.Context, msgs []*domain.Message) error {
+func (b *HybridBroker) GetLastAppliedIndex() (uint64, error) {
+	return b.store.GetLastRaftIndex()
+}
+
+func (b *HybridBroker) PublishBatch(ctx context.Context, msgs []*domain.Message, raftIndex uint64) error {
 	for _, msg := range msgs {
 		if msg.ID == "" {
 			msg.ID = uuid.New().String()
 		}
 	}
-	return b.store.AppendBatch(msgs)
+	return b.store.AppendBatch(msgs, raftIndex)
 }
 
 func (b *HybridBroker) PublishDirect(ctx context.Context, msgs []*domain.Message) error {
@@ -288,7 +292,7 @@ func (b *HybridBroker) runOffsetCommitter(sub *Subscriber, topic string) {
 				if b.replicationFunc != nil {
 					b.replicationFunc(topic, sub.GroupID, newOffset)
 				} else {
-					err := b.store.SaveOffset(topic, sub.GroupID, newOffset)
+					err := b.store.SaveOffset(topic, sub.GroupID, newOffset, 0)
 					if err != nil {
 						b.logger.Error("Failed to save offset locally", "err", err)
 					}
@@ -443,6 +447,10 @@ func (b *HybridBroker) Unsubscribe(topic string, subID string) {
 
 	b.logger.Info("Subscriber removed gracefully", "topic", topic, "id", subID)
 	metrics.UpdateSubscribers(topic, -1)
+}
+
+func (b *HybridBroker) SyncOffsetWithIndex(topic, groupID string, offset uint64, raftIndex uint64) error {
+	return b.store.SaveOffset(topic, groupID, offset, raftIndex)
 }
 
 func (b *HybridBroker) Close() {

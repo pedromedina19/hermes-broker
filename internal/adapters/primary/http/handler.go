@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/pedromedina19/hermes-broker/internal/adapters/secondary/config"
 	"github.com/pedromedina19/hermes-broker/internal/core/metrics"
@@ -25,7 +26,7 @@ type PublishBatchRequest struct {
 	Payloads []string `json:"payloads"`
 	Mode     int      `json:"mode"`
 }
-func NewRestHandler(service *services.BrokerService, cfg config.Config) *RestHandler {
+func NewHttpHandler(service *services.BrokerService, cfg config.Config) *RestHandler {
 	return &RestHandler{
 		service: service,
 		cfg:     cfg,
@@ -38,10 +39,43 @@ type PublishRequest struct {
 	Mode    int    `json:"mode"`
 }
 
+func (h *RestHandler) getLeaderHttpAddr() string {
+	leaderRaftAddr := h.service.GetLeaderID()
+	if leaderRaftAddr == "" {
+		return ""
+	}
+	host := strings.Replace(leaderRaftAddr, "node-", "hermes-", 1)
+	host = strings.Split(host, ":")[0] 
+	
+	if !strings.Contains(host, "hermes-internal") {
+		host = fmt.Sprintf("%s.hermes-internal", host)
+	}
+	return fmt.Sprintf("%s:8080", host)
+}
+
+func (h *RestHandler) HandleGraphQL(next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.service.IsLeader() {
+			leaderAddr := h.getLeaderHttpAddr()
+			if leaderAddr != "" {
+				w.Header().Set("X-Leader-Hint", leaderAddr)
+			}
+		}
+		next.ServeHTTP(w, r)
+	}
+}
+
 func (h *RestHandler) HandlePublish(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+
+	if !h.service.IsLeader() {
+		leaderAddr := h.getLeaderHttpAddr()
+		if leaderAddr != "" {
+			w.Header().Set("X-Leader-Hint", leaderAddr)
+		}
 	}
 
 	var req PublishRequest
@@ -95,7 +129,6 @@ func (h *RestHandler) HandleSubscribeSSE(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Configure Headers for SSE
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")

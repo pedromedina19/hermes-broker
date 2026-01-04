@@ -274,8 +274,8 @@ func (s *BrokerService) runFastBatcher() {
 				batchPtrs[i] = &batch[i]
 			}
 
-			if err := s.engine.PublishBatch(context.Background(), batchPtrs); err != nil {
-				slog.Error("FastBatcher failed local write", "err", err)
+			if err := s.engine.PublishBatch(context.Background(), batchPtrs, 0); err != nil {
+					slog.Error("FastBatcher failed local write", "err", err)
 			} else {
 				for _, m := range batch {
 					metrics.IncPublished(m.Topic, 1)

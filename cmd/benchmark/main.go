@@ -16,6 +16,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/pedromedina19/hermes-broker/pb"
 )
@@ -31,9 +32,9 @@ var (
 	topic = "benchmark-topic"
 
 	// Global Atomic Metrics
-	totalReqs     uint64 // Messages sent successfully
-	totalErrs     uint64 // Actual network/logic errors
-	totalReceived uint64 // Messages that arrived at the Auditor
+	totalReqs     uint64
+	totalErrs     uint64
+	totalReceived uint64
 
 	pubA uint64
 	pubB uint64
@@ -48,6 +49,49 @@ var (
 
 	rateLimitPerWorker int
 )
+
+type BatchRateLimiter struct {
+	rate      int
+	batchSize int
+	count     int
+	start     time.Time
+}
+
+func NewRateLimiter(rate int) *BatchRateLimiter {
+	if rate <= 0 {
+		return nil
+	}
+
+	batchSize := rate / 100
+	if batchSize < 1 {
+		batchSize = 1
+	}
+
+	return &BatchRateLimiter{
+		rate:      rate,
+		batchSize: batchSize,
+		start:     time.Now(),
+	}
+}
+
+func (r *BatchRateLimiter) Wait() {
+	if r == nil {
+		return
+	}
+
+	r.count++
+	if r.count >= r.batchSize {
+		expectedDuration := time.Duration(r.count) * time.Second / time.Duration(r.rate)
+		elapsed := time.Since(r.start)
+
+		if elapsed < expectedDuration {
+			time.Sleep(expectedDuration - elapsed)
+		}
+
+		r.start = time.Now()
+		r.count = 0
+	}
+}
 
 func recordError(err error) {
 	if err == nil {
@@ -67,13 +111,6 @@ func recordError(err error) {
 	errorMu.Lock()
 	errorCounts[errMsg]++
 	errorMu.Unlock()
-}
-
-func throttle() {
-	if rateLimitPerWorker > 0 {
-		sleepTime := time.Second / time.Duration(rateLimitPerWorker)
-		time.Sleep(sleepTime)
-	}
 }
 
 func main() {
@@ -377,50 +414,59 @@ func getTopicForID(id int) string {
 	return topic
 }
 
-
 func runGrpcWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 	defer wg.Done()
 	targetIndex := id % len(grpcPool)
+	currentAddr := grpcPool[targetIndex]
+
+	limiter := NewRateLimiter(rateLimitPerWorker)
+
 	var conn *grpc.ClientConn
 	var client pb.BrokerServiceClient
 
-	reconnect := func() bool {
+	connect := func() bool {
 		if conn != nil {
 			conn.Close()
 		}
-		addr := grpcPool[targetIndex]
 		var err error
-		conn, err = grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err = grpc.NewClient(currentAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
-			targetIndex = (targetIndex + 1) % len(grpcPool)
 			return false
 		}
 		client = pb.NewBrokerServiceClient(conn)
 		return true
 	}
 
-	if !reconnect() {
+	if !connect() {
 		return
 	}
 	defer conn.Close()
 
-	targetTopic := getTopicForID(id)
 	payload := []byte(fmt.Sprintf("gRPC-%d", id))
+	targetTopic := getTopicForID(id)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			throttle()
+			limiter.Wait()
+
+			var header metadata.MD
 			_, err := client.Publish(ctx, &pb.PublishRequest{
-				Topic:   targetTopic,
-				Payload: payload,
-				Mode:    deliveryMode,
-			})
+				Topic: targetTopic, Payload: payload, Mode: deliveryMode,
+			}, grpc.Header(&header))
+
+			if hints := header.Get("x-leader-hint"); len(hints) > 0 && hints[0] != "" {
+				if hints[0] != currentAddr {
+					currentAddr = hints[0]
+					connect()
+					continue
+				}
+			}
+
 			if err != nil {
-				targetIndex = (targetIndex + 1) % len(grpcPool)
-				reconnect()
+				connect()
 				time.Sleep(100 * time.Millisecond)
 			} else {
 				atomic.AddUint64(&totalReqs, 1)
@@ -438,50 +484,46 @@ func runGrpcWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 func runGrpcStreamWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 	defer wg.Done()
 	targetIndex := id % len(grpcPool)
+	currentAddr := grpcPool[targetIndex]
 
-	addr := grpcPool[targetIndex]
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Printf("Stream Worker %d connection failed: %v", id, err)
-		return
-	}
-	defer conn.Close()
+	limiter := NewRateLimiter(rateLimitPerWorker)
 
-	client := pb.NewBrokerServiceClient(conn)
-	targetTopic := getTopicForID(id)
-	payload := []byte(fmt.Sprintf("Stream-%d", id))
-
+	var conn *grpc.ClientConn
 	var stream pb.BrokerService_PublishStreamClient
 
-	establishStream := func() error {
-		var err error
-		stream, err = client.PublishStream(context.Background())
-		return err
-	}
-
-	if err := establishStream(); err != nil {
-		log.Printf("Worker %d failed initial stream: %v", id, err)
-		return
-	}
+	defer func() {
+		if stream != nil {
+			stream.CloseAndRecv()
+		}
+		if conn != nil {
+			conn.Close()
+		}
+	}()
 
 	req := &pb.PublishRequest{
-		Topic:   targetTopic,
-		Payload: payload,
+		Topic:   getTopicForID(id),
+		Payload: []byte(fmt.Sprintf("Stream-%d", id)),
 		Mode:    deliveryMode,
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			if stream != nil {
-				_, err := stream.CloseAndRecv()
-				if err != nil && err != io.EOF {
-				}
-			}
 			return
 		default:
+			limiter.Wait()
+
 			if stream == nil {
-				if err := establishStream(); err != nil {
+				var redirectAddr string
+				var err error
+				stream, conn, redirectAddr, err = connectAndStream(ctx, currentAddr)
+
+				if redirectAddr != "" {
+					currentAddr = redirectAddr
+					continue
+				}
+
+				if err != nil {
 					time.Sleep(100 * time.Millisecond)
 					continue
 				}
@@ -491,20 +533,23 @@ func runGrpcStreamWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 
 			if err == io.EOF {
 				stream = nil
+				conn.Close()
+				conn = nil
 				continue
 			}
 			if err != nil {
-				recordError(err)
 				stream = nil
+				conn.Close()
+				conn = nil
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
 
 			atomic.AddUint64(&totalReqs, 1)
-			if targetTopic == "topic-A" {
+			if req.Topic == "topic-A" {
 				atomic.AddUint64(&pubA, 1)
 			}
-			if targetTopic == "topic-B" {
+			if req.Topic == "topic-B" {
 				atomic.AddUint64(&pubB, 1)
 			}
 		}
@@ -514,15 +559,13 @@ func runGrpcStreamWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 func runRestWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 	defer wg.Done()
 	client := &http.Client{Timeout: 1 * time.Second}
+
 	targetIndex := id % len(httpPool)
-	targetTopic := getTopicForID(id)
+	currentHost := httpPool[targetIndex]
 
-	modeVal := 0
-	if deliveryMode == pb.DeliveryMode_PERFORMANCE {
-		modeVal = 1
-	}
+	limiter := NewRateLimiter(rateLimitPerWorker)
 
-	jsonStr := fmt.Sprintf(`{"topic": "%s", "payload": "REST-%d", "mode": %d}`, targetTopic, id, modeVal)
+	jsonStr := fmt.Sprintf(`{"topic": "%s", "payload": "REST-%d", "mode": %d}`, getTopicForID(id), id, deliveryMode)
 	var buf bytes.Buffer
 
 	for {
@@ -530,28 +573,33 @@ func runRestWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 		case <-ctx.Done():
 			return
 		default:
-			throttle()
+			limiter.Wait()
 			buf.Reset()
 			buf.WriteString(jsonStr)
-			url := "http://" + httpPool[targetIndex] + "/publish"
 
+			url := fmt.Sprintf("http://%s/publish", currentHost)
 			resp, err := client.Post(url, "application/json", bytes.NewBuffer(buf.Bytes()))
-			if err != nil || (resp != nil && resp.StatusCode != 200) {
-				if resp != nil {
-					resp.Body.Close()
+
+			if err == nil && resp != nil {
+				hint := resp.Header.Get("X-Leader-Hint")
+				if hint != "" && hint != currentHost {
+					currentHost = hint
 				}
-				targetIndex = (targetIndex + 1) % len(httpPool)
+				resp.Body.Close()
+			}
+
+			if err != nil || (resp != nil && resp.StatusCode != 200) {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
+
 			atomic.AddUint64(&totalReqs, 1)
-			if targetTopic == "topic-A" {
+			if getTopicForID(id) == "topic-A" {
 				atomic.AddUint64(&pubA, 1)
 			}
-			if targetTopic == "topic-B" {
+			if getTopicForID(id) == "topic-B" {
 				atomic.AddUint64(&pubB, 1)
 			}
-			resp.Body.Close()
 		}
 	}
 }
@@ -559,16 +607,18 @@ func runRestWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 func runGraphqlWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 	defer wg.Done()
 	client := &http.Client{Timeout: 1 * time.Second}
+
 	targetIndex := id % len(httpPool)
-	targetTopic := getTopicForID(id)
+	currentHost := httpPool[targetIndex]
+
+	limiter := NewRateLimiter(rateLimitPerWorker)
 
 	query := ""
 	if deliveryMode == pb.DeliveryMode_PERFORMANCE {
-		query = fmt.Sprintf(`{"query": "mutation { publish(topic: \"%s\", payload: \"GQL-%d\", mode: PERFORMANCE) { success } }"}`, targetTopic, id)
+		query = fmt.Sprintf(`{"query": "mutation { publish(topic: \"%s\", payload: \"GQL-%d\", mode: PERFORMANCE) { success } }"}`, getTopicForID(id), id)
 	} else {
-		query = fmt.Sprintf(`{"query": "mutation { publish(topic: \"%s\", payload: \"GQL-%d\") { success } }"}`, targetTopic, id)
+		query = fmt.Sprintf(`{"query": "mutation { publish(topic: \"%s\", payload: \"GQL-%d\") { success } }"}`, getTopicForID(id), id)
 	}
-
 	var buf bytes.Buffer
 
 	for {
@@ -576,30 +626,62 @@ func runGraphqlWorker(ctx context.Context, wg *sync.WaitGroup, id int) {
 		case <-ctx.Done():
 			return
 		default:
-			throttle()
+			limiter.Wait()
 			buf.Reset()
 			buf.WriteString(query)
-			url := "http://" + httpPool[targetIndex] + "/query"
 
+			url := fmt.Sprintf("http://%s/query", currentHost)
 			resp, err := client.Post(url, "application/json", bytes.NewBuffer(buf.Bytes()))
-			if err != nil || (resp != nil && resp.StatusCode != 200) {
-				if resp != nil {
-					resp.Body.Close()
+
+			if err == nil && resp != nil {
+				hint := resp.Header.Get("X-Leader-Hint")
+				if hint != "" && hint != currentHost {
+					currentHost = hint
 				}
+				resp.Body.Close()
+			}
+
+			if err != nil || (resp != nil && resp.StatusCode != 200) {
 				targetIndex = (targetIndex + 1) % len(httpPool)
+				currentHost = httpPool[targetIndex]
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
+
 			atomic.AddUint64(&totalReqs, 1)
-			if targetTopic == "topic-A" {
+			if getTopicForID(id) == "topic-A" {
 				atomic.AddUint64(&pubA, 1)
 			}
-			if targetTopic == "topic-B" {
+			if getTopicForID(id) == "topic-B" {
 				atomic.AddUint64(&pubB, 1)
 			}
-			resp.Body.Close()
 		}
 	}
+}
+
+func connectAndStream(ctx context.Context, addr string) (pb.BrokerService_PublishStreamClient, *grpc.ClientConn, string, error) {
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, nil, "", err
+	}
+
+	client := pb.NewBrokerServiceClient(conn)
+	stream, err := client.PublishStream(context.Background())
+	if err != nil {
+		conn.Close()
+		return nil, nil, "", err
+	}
+
+	header, err := stream.Header()
+	if err == nil {
+		hints := header.Get("x-leader-hint")
+		if len(hints) > 0 && hints[0] != "" && hints[0] != addr {
+			conn.Close()
+			return nil, nil, hints[0], fmt.Errorf("redirect")
+		}
+	}
+
+	return stream, conn, "", nil
 }
 
 func printReport(elapsed time.Duration, scenario string) {

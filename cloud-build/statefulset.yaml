@@ -1,18 +1,3 @@
-# Internal service for Raft (Headless) communication.
-apiVersion: v1
-kind: Service
-metadata:
-  name: hermes-internal
-  labels:
-    app: hermes
-spec:
-  clusterIP: None
-  selector:
-    app: hermes
-  ports:
-    - name: raft
-      port: 6000
----
 # Hermes Cluster Controller
 apiVersion: apps/v1
 kind: StatefulSet

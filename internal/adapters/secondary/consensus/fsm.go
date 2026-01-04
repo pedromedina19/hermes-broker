@@ -14,27 +14,41 @@ import (
 
 // BrokerFSM is the bridge between Raft and your Memory Engine
 type BrokerFSM struct {
-	engine ports.BrokerEngine
-	logger *slog.Logger
-	nodeID string
+	engine           ports.BrokerEngine
+	logger           *slog.Logger
+	nodeID           string
+	lastAppliedIndex uint64
 }
 
 func NewBrokerFSM(engine ports.BrokerEngine, nodeID string, logger *slog.Logger) *BrokerFSM {
+	lastIndex, err := engine.GetLastAppliedIndex()
+	if err != nil {
+		logger.Error("Failed to load last applied index", "err", err)
+		lastIndex = 0
+	}
+
+	logger.Info("FSM Initialized", "last_applied_index", lastIndex)
 	return &BrokerFSM{
-		engine: engine,
-		nodeID: nodeID,
-		logger: logger,
+		engine:           engine,
+		nodeID:           nodeID,
+		logger:           logger,
+		lastAppliedIndex: lastIndex,
 	}
 }
 
 // Apply is called by Raft when a log is committed
 func (fsm *BrokerFSM) Apply(l *raft.Log) interface{} {
+	if l.Index <= fsm.lastAppliedIndex {
+		// fsm.logger.Debug("Skipping replay", "index", l.Index, "last", fsm.lastAppliedIndex)
+		return nil
+	}
+
 	var cmd domain.RaftCommand
 
 	if err := json.Unmarshal(l.Data, &cmd); err != nil {
 		var messages []domain.Message
 		if errLegacy := json.Unmarshal(l.Data, &messages); errLegacy == nil {
-			fsm.applyPublish(messages)
+			fsm.applyPublish(messages, l.Index)
 			return nil
 		}
 		fsm.logger.Error("FSM: Failed to unmarshal", "error", err)
@@ -43,37 +57,40 @@ func (fsm *BrokerFSM) Apply(l *raft.Log) interface{} {
 
 	switch cmd.Type {
 	case domain.LogTypePublish:
-		fsm.applyPublish(cmd.Messages)
+		fsm.applyPublish(cmd.Messages, l.Index)
+
 	case domain.LogTypeOffset:
 		if cmd.OffsetCommit != nil {
-			fsm.applyOffset(*cmd.OffsetCommit)
+			fsm.applyOffset(*cmd.OffsetCommit, l.Index)
 		}
+
 	case domain.LogTypeReplica:
 		if cmd.OriginNodeID == fsm.nodeID {
-			fsm.logger.Error("IGNORING SELF REPLICA - WORKING CORRECTLY")
 			return nil
 		}
-		fsm.applyPublish(cmd.Messages)
+		fsm.applyPublish(cmd.Messages, l.Index)
 
 	default:
 		if cmd.Type == "" && len(cmd.Messages) > 0 {
-			fsm.applyPublish(cmd.Messages)
+			fsm.applyPublish(cmd.Messages, l.Index)
 		} else {
 			fsm.logger.Warn("Unknown Raft Command Type", "type", cmd.Type)
 		}
 	}
 
+	fsm.lastAppliedIndex = l.Index
+
 	return nil
 }
 
-func (fsm *BrokerFSM) applyPublish(messages []domain.Message) {
+func (fsm *BrokerFSM) applyPublish(messages []domain.Message, raftIndex uint64) {
 	batchPtrs := make([]*domain.Message, len(messages))
 	for i := range messages {
 		batchPtrs[i] = &messages[i]
 	}
 
-	if err := fsm.engine.PublishBatch(context.TODO(), batchPtrs); err != nil {
-		fsm.logger.Error("FSM: Failed to publish batch to engine", "count", len(messages), "error", err)
+	if err := fsm.engine.PublishBatch(context.TODO(), batchPtrs, raftIndex); err != nil {
+		fsm.logger.Error("FSM: Failed to publish batch", "error", err)
 	}
 
 	for _, msg := range messages {
@@ -81,9 +98,9 @@ func (fsm *BrokerFSM) applyPublish(messages []domain.Message) {
 	}
 }
 
-func (fsm *BrokerFSM) applyOffset(off domain.Offset) {
-	if err := fsm.engine.SyncOffset(off.Topic, off.GroupID, off.Value); err != nil {
-		fsm.logger.Error("FSM: Failed to sync offset", "group", off.GroupID, "error", err)
+func (fsm *BrokerFSM) applyOffset(off domain.Offset, raftIndex uint64) {
+	if err := fsm.engine.SyncOffsetWithIndex(off.Topic, off.GroupID, off.Value, raftIndex); err != nil {
+		fsm.logger.Error("FSM: Failed to sync offset", "error", err)
 	}
 }
 
