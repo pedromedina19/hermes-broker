@@ -11,8 +11,7 @@ import (
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
-	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
-	bolt "go.etcd.io/bbolt"
+	raftpebble "github.com/syncplify/raft-pebble"
 )
 
 const (
@@ -24,6 +23,7 @@ type RaftNode struct {
 	logger   *slog.Logger
 	config   RaftConfig
 	hasState bool
+	store *raftpebble.PebbleKVStore
 }
 
 type RaftConfig struct {
@@ -78,34 +78,34 @@ func NewRaftNode(conf RaftConfig, fsm *BrokerFSM, logger *slog.Logger) (*RaftNod
 
 	os.MkdirAll(conf.DataDir, 0700)
 
-	// BoltDB (Log Store)
-	boltFile := filepath.Join(conf.DataDir, "raft.db")
+	dbDir := filepath.Join(conf.DataDir, "raft.pebble")
+	walDir := filepath.Join(conf.DataDir, "raft.pebble.wal")
 
-	logStore, err := raftboltdb.New(raftboltdb.Options{
-		Path: boltFile,
-		BoltOptions: &bolt.Options{
-			NoSync:  true,
-			Timeout: 1 * time.Second,
-		},
-	})
-
+	kv, err := raftpebble.New(
+		raftpebble.WithDbDirPath(dbDir),
+		raftpebble.WithWalDirPath(walDir),
+		raftpebble.WithConfig(raftpebble.GetTinyMemRaftLogRocksDBConfig()),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("new bolt store: %w", err)
+		return nil, fmt.Errorf("new pebble raft store: %w", err)
 	}
 
 	// Snapshot Store
 	snapshotStore, err := raft.NewFileSnapshotStore(conf.DataDir, 1, os.Stderr)
 	if err != nil {
+		_ = kv.Close()
 		return nil, fmt.Errorf("file snapshot store: %w", err)
 	}
 
-	hasState, err := raft.HasExistingState(logStore, logStore, snapshotStore)
+	hasState, err := raft.HasExistingState(kv, kv, snapshotStore)
 	if err != nil {
+		_ = kv.Close()
 		return nil, err
 	}
 
-	r, err := raft.NewRaft(config, fsm, logStore, logStore, snapshotStore, transport)
+	r, err := raft.NewRaft(config, fsm, kv, kv, snapshotStore, transport)
 	if err != nil {
+		_ = kv.Close()
 		return nil, fmt.Errorf("new raft: %w", err)
 	}
 
@@ -174,4 +174,13 @@ func (rn *RaftNode) IsLeader() bool {
 
 func (rn *RaftNode) HasState() bool {
 	return rn.hasState
+}
+
+func (rn *RaftNode) Close() {
+	if rn == nil {
+		return
+	}
+	if rn.Raft != nil {
+		_ = rn.Raft.Shutdown().Error()
+	}
 }

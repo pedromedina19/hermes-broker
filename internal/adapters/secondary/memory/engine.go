@@ -59,8 +59,8 @@ type HybridBroker struct {
 }
 
 func NewHybridBroker(dataDir string, bufferSize int, logger ports.Logger) *HybridBroker {
-	storePath := filepath.Join(dataDir, "messages.db")
-	store, err := storage.NewBoltLogStore(storePath)
+	storeDir := filepath.Join(dataDir, "messages.pebble")
+	store, err := storage.NewPebbleLogStore(storeDir)
 	if err != nil {
 		panic(err)
 	}
@@ -201,11 +201,11 @@ func (b *HybridBroker) Subscribe(ctx context.Context, topic string, groupID stri
 	case "":
 		startOffset = b.store.LastOffset(topic) + 1
 	case "__REPLAY__":
-		startOffset = 0
+		startOffset = 1
 	default:
 		savedOffset, err := b.store.GetOffset(topic, groupID)
-		if err != nil || savedOffset == 0 {
-			startOffset = 0
+		if err != nil {
+			startOffset = 1
 		} else {
 			startOffset = savedOffset + 1
 		}

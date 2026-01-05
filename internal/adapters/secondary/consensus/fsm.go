@@ -66,9 +66,15 @@ func (fsm *BrokerFSM) Apply(l *raft.Log) interface{} {
 
 	case domain.LogTypeReplica:
 		if cmd.OriginNodeID == fsm.nodeID {
-			return nil
+			// Leader has already persisted locally in fastBatcher (raftIndex=0)
+			// Here we only advance the last_raft_index in the store for debug/recovery
+			if err := fsm.engine.PublishBatch(context.TODO(), nil, l.Index); err != nil {
+				fsm.logger.Warn("FSM: failed to persist last_raft_index for self replica", "err", err, "index", l.Index)
+			}
+			break
 		}
 		fsm.applyPublish(cmd.Messages, l.Index)
+
 
 	default:
 		if cmd.Type == "" && len(cmd.Messages) > 0 {

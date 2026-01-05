@@ -125,8 +125,11 @@ func main() {
 	logger.Info("Shutting down servers...")
 
 	grpcServer.GracefulStop()
-	httpServer.Close()
+	_ = httpServer.Close()
 	brokerEngine.Close()
+	if raftNode != nil {
+		raftNode.Close()
+	}
 
 	logger.Info("Hermes Shutdown complete")
 }
