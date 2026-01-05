@@ -1,40 +1,120 @@
 # Hermes Broker
 
-Hermes is a resilient, in-memory message broker built with Go and gRPC, designed for high throughput and reliability. It implements Hexagonal Architecture (Ports & Adapters) to ensure decoupling between the core logic, communication protocols, and storage.
+Hermes is a high-throughput message broker written in **Go**, built to explore real-world tradeoffs in distributed systems: **latency vs durability**, **throughput vs consistency**, and **simplicity vs control**.
 
-## Key Features
+It supports **3 delivery modes** (strong / eventual / in-memory), runs as a **Raft-replicated cluster**, and uses **Pebble** for durable local storage.
 
-- **gRPC Protocol**: High-performance binary communication with Protobuf.
-- **In-Memory Engine**: Ultra-low latency message routing using Go Channels and Mutexes.
-- **Persistence (WAL)**: Implements a Write-Ahead Log to persist messages on disk, ensuring data recovery in case of crashes.
-- **Reliability System**:
-  - **Acknowledgments (ACK)**: Ensures messages are processed before removal.
-  - **Automatic Retries**: Re-delivers messages if no ACK is received within the timeout window.
-  - **Dead Letter Queue (DLQ)**: Automatically moves failed messages to a specific topic (`hermes.dlq`) after max retries.
-- **Scalability**:
-  - **Pub/Sub (Fan-out)**: Broadcasts messages to all independent subscribers.
-  - **Consumer Groups**: Supports Load Balancing (Worker Queue pattern) to distribute processing across multiple instances.
+---
 
-## Architecture
+## Highlights
 
-- **Core**: Pure Go logic, isolated from external dependencies (`internal/core`).
-- **Primary Adapter**: gRPC Server handling incoming requests (`internal/adapters/primary/grpc`).
-- **Secondary Adapters**:
-  - **Memory Engine**: Manages channels and concurrent access.
-  - **File Persistence**: Handles `hermes.wal` for durability.
+- **Three delivery modes**
+  - **CONSISTENT (strong):** acknowledged only after Raft commit + apply (quorum)
+  - **EVENTUAL:** leader writes first, followers replicate asynchronously
+  - **PERFORMANCE (weak / RAM):** in-memory pipeline (ultra-low latency, no durability)
+- **Distributed cluster (Raft)**
+  - Leader election + log replication
+  - Followers proxy publish/subscribe/ack to leader when needed
+- **Storage**
+  - **Message log:** Pebble (`messages.pebble/`)
+  - **Raft log:** `raft-pebble` (WAL + KV)
+- **Protocols**
+  - **gRPC + gRPC streaming** (primary path)
+  - HTTP gateway (REST / GraphQL) for convenience and debugging
+- **Reliability layer**
+  - ACK tracking + retry loop
+  - DLQ topic: `hermes.dlq`
+  - Consumer groups (offset tracking)
 
-## Usage
+---
 
-### 1. Start the Server
-The server will start on port `:50051` and recover any state from `hermes.wal`.
+## Delivery Modes
+
+| Mode | Publish acknowledgment | Durability | Replication | When to use |
+|------|------------------------|-----------|------------|-------------|
+| **CONSISTENT** | After Raft commit + apply | ✅ disk | ✅ quorum (sync) | strongest guarantee |
+| **EVENTUAL** | Fast ack on leader | ✅ disk (leader first) | ✅ async to followers | best balance |
+| **PERFORMANCE** | In-memory delivery pipeline | ❌ (RAM only) | ❌ (RAM only) | max throughput / low latency |
+
+> **Important:** PERFORMANCE mode is not durable. Messages can be lost on restart/crash.
+
+---
+
+## Benchmarks (GKE – e2-medium class)
+
+Benchmarks are executed using `cmd/benchmark/main.go` (scenario `live`), mostly over **gRPC streaming**.
+
+- **CONSISTENT:** ~4k msg/s (strong consistency)
+- **EVENTUAL (grpc-stream):** ~47k msg/s
+- **EVENTUAL (sustained):** ~9.3k msg/s @ 10k msg/s target for 1h+
+- Disk footprint after sustained run: ~**1.1–1.2 GB per node** (replicated)
+
+Full details: see [`benchmark.md`](./benchmark.md)
+
+---
+
+## Run Locally (Docker Compose)
+
+> `*.hermes-internal` resolves only **inside containers**. From your host machine, use `localhost` ports.
+
+Start the cluster:
+
+```bash
+docker compose up --build
+````
+
+Ports (host → container):
+
+* hermes-1 → `localhost:50051` (HTTP `localhost:8080`)
+* hermes-2 → `localhost:50052` (HTTP `localhost:8081`)
+* hermes-3 → `localhost:50053` (HTTP `localhost:8082`)
+
+
+### Run benchmark from host (example)
+
+```bash
+go run cmd/benchmark/main.go \
+  -scenario=live \
+  -workers=1 \
+  -duration=30s \
+  -mode=eventual \
+  -protocol=grpc-stream \
+  -grpc-targets='localhost:50051' \
+  -sub-target='localhost:50051'
+```
+
+---
+
+## Run on GKE (Cluster)
+
+Hermes is typically deployed as a **StatefulSet** (1 pod per node), using a **headless service** for stable DNS.
+
+See manifests under `cloud-build/`:
+
+* `statefulset.yaml`
+* `internal-svc.yaml`
+* `client-svc.yaml`
+* (optional) `bench-runner-isolated.yaml`
+
+---
+
+## Development
+
+Run server:
 
 ```bash
 go run cmd/server/main.go
+```
 
+Generate Protobuf:
 
-
+```bash
 protoc --go_out=. --go-grpc_out=. proto/broker.proto
+```
 
+GraphQL (if using gqlgen in your setup):
 
+```bash
 go get github.com/99designs/gqlgen@v0.17.85
 go run github.com/99designs/gqlgen generate
+```
